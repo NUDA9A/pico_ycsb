@@ -20,6 +20,12 @@ fi
 
 echo "Binary: $($TARANTOOL --version | head -1)"
 echo "Scale: $SCALE"
+echo "Environment overrides (WORKERS: A/C; WRITERS/READERS: B):"
+for parameter in NUM_KEYS VALUE_SIZE VINYL_MEMORY VINYL_CACHE BATCH_SIZE \
+                 DURATION_SECONDS WARMUP_SECONDS WORKERS WRITERS READERS; do
+    echo "${parameter}: ${!parameter-<default>}"
+done
+echo "Resolved parameters are recorded as Configuration in picodata.log."
 echo ""
 
 # Create a Lua snippet that adds SI metrics to any workload.
@@ -59,18 +65,18 @@ for window in auto zero; do
         # Build patched script: original + SI metrics + window setting.
         PATCHED="${DIR}/workload.lua"
         cp "$SCRIPT" "$PATCHED"
+        cp "${SCRIPT_DIR}/benchmark.lua" "${DIR}/benchmark.lua"
 
-        # Inject SI metrics fiber and window setting after load_data().
-        # Find the line "load_data()" and append after it.
+        # All workloads have the same setup-end marker, including B.
         if [ "$window" = "zero" ]; then
-            sed -i '/^load_data()/a \
+            sed -i '/^benchmark[.]event.*setup.*end/a \
 local _ffi = require("ffi")\
 _ffi.cdef("void vinyl_set_conflict_window(int64_t w)")\
 _ffi.C.vinyl_set_conflict_window(0)\
 require("log").info("bench: conflict_window forced to 0")\
 dofile("/tmp/si_metrics_patch.lua")' "$PATCHED"
         else
-            sed -i '/^load_data()/a \
+            sed -i '/^benchmark[.]event.*setup.*end/a \
 require("log").info("bench: conflict_window = auto")\
 dofile("/tmp/si_metrics_patch.lua")' "$PATCHED"
         fi

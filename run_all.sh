@@ -29,7 +29,12 @@ fi
 echo "Binary: $($TARANTOOL --version | head -1)"
 echo "Prefix: $PREFIX"
 echo "Scale: $SCALE"
-echo "VINYL_CACHE: ${VINYL_CACHE:-0}"
+echo "Environment overrides (WORKERS: A/C; WRITERS/READERS: B):"
+for parameter in NUM_KEYS VALUE_SIZE VINYL_MEMORY VINYL_CACHE BATCH_SIZE \
+                 DURATION_SECONDS WARMUP_SECONDS WORKERS WRITERS READERS; do
+    echo "${parameter}: ${!parameter-<default>}"
+done
+echo "Resolved parameters are recorded as Configuration in picodata.log."
 echo ""
 
 for w in a b c; do
@@ -41,7 +46,7 @@ for w in a b c; do
     (cd "$DIR" && "$TARANTOOL" "$SCRIPT" "" "$SCALE")
     echo ""
     echo "--- Results ---"
-    grep -E '(OPS|TPS|Errors|Ranges|Runs:|Write amp|Space amp|Read amp|Compaction I/O|Compaction tasks)' \
+    sed -n '/=== FINAL REPORT ===/,/=== END REPORT ===/p' \
         "$DIR/picodata.log" | sed 's/.*I> //'
     echo ""
 done
