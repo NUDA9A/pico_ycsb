@@ -2,8 +2,8 @@
 --
 -- Vinyl Workload A: Update-Heavy (modeled after YCSB-A / RocksDB overwrite)
 --
--- Mix: 50% point reads, 50% updates on existing keys.
--- Distribution: Zipfian (hot keys accessed much more often).
+-- Default mix: 50% point reads, 50% updates on existing keys.
+-- Default distribution: Zipfian (hot keys accessed much more often).
 -- Purpose: stress overlapping runs, fuse filter effectiveness for
 -- point lookups, and the overlap-based compaction driver.
 --
@@ -25,14 +25,13 @@ local NUM_KEYS = config.num_keys
 local BATCH_SIZE = config.batch_size
 local LOAD_BATCH = 5000
 local NUM_FIBERS = config.workers
-local ZIPF_THETA = 0.99
 
 box.cfg{
     log       = 'picodata.log',
     log_level = 'info',
     txn_isolation = 'snapshot',
     checkpoint_count    = 2,
-    checkpoint_interval = 600,
+    checkpoint_interval = config.checkpoint_interval,
     vinyl_cache         = config.vinyl_cache,
     vinyl_memory        = config.vinyl_memory,
 }
@@ -56,42 +55,11 @@ end
 local space = box.space.bench_a
 
 -------------------------------------------------------------------------------
--- Zipfian distribution (O(1) memory, YCSB-style)
---
--- Uses the Euler-Maclaurin approximation for the generalized
--- harmonic number and the YCSB inverse-CDF method.
+-- Key and operation selection
 -------------------------------------------------------------------------------
 
-local zipf_n     = NUM_KEYS
-local zipf_theta = ZIPF_THETA
-local zipf_alpha = 1.0 / (1.0 - zipf_theta)
-
--- Approximate H(n, theta) using the integral + correction terms.
-local function approx_zeta(n, theta)
-    local ns = n ^ (1.0 - theta)
-    return (ns - 1.0) / (1.0 - theta) +
-           0.5 * (1.0 + n ^ (-theta)) +
-           theta / 12.0 * (1.0 - n ^ (-theta - 1.0))
-end
-
-local zipf_zeta_n = approx_zeta(zipf_n, zipf_theta)
-local zipf_zeta_2 = 1.0 + (0.5 ^ zipf_theta)
-local zipf_eta    = (1.0 - (2.0 / zipf_n) ^ (1.0 - zipf_theta)) /
-                    (1.0 - zipf_zeta_2 / zipf_zeta_n)
-
-local function zipf_next()
-    local u  = math.random()
-    local uz = u * zipf_zeta_n
-    if uz < 1.0 then
-        return 1
-    end
-    if uz < zipf_zeta_2 then
-        return 2
-    end
-    -- Bound the approximation for small datasets (notably n=2).
-    return math.min(zipf_n, 1 + math.floor(zipf_n *
-               ((zipf_eta * u - zipf_eta + 1.0) ^ zipf_alpha)))
-end
+local random_key = benchmark.key_generator(config)
+local next_operation = benchmark.operation_selector(config, {'read', 'update'})
 
 -------------------------------------------------------------------------------
 -- Random value generator
@@ -150,8 +118,8 @@ local function worker(stats)
     benchmark.transaction(stats, function()
         local completed = {reads = 0, writes = 0, read_miss = 0}
         for _ = 1, BATCH_SIZE do
-            local key = zipf_next()
-            if math.random() < 0.5 then
+            local key = random_key(NUM_KEYS)
+            if next_operation() == 'read' then
                 stats.op_attempts = stats.op_attempts + 1
                 local tuple = space:get(key)
                 completed.reads = completed.reads + 1

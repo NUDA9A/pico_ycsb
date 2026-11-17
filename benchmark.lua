@@ -51,7 +51,20 @@ function M.config(workload, args)
                             workload == 'a' and args[3] or nil),
         duration_seconds = duration,
         warmup_seconds = option('WARMUP_SECONDS', 0, 0),
+        key_distribution = os.getenv('KEY_DISTRIBUTION') or
+                           (workload == 'a' and 'zipfian' or workload == 'b' and 'latest' or 'uniform'),
+        zipf_theta = option('ZIPF_THETA', 0.99, 0),
+        hotset_size = option('HOTSET_SIZE', 1, 0),
+        checkpoint_mode = os.getenv('CHECKPOINT_MODE') or 'auto',
+        checkpoint_interval = option('CHECKPOINT_INTERVAL', 600, 0),
     }
+    assert(config.key_distribution == 'uniform' or config.key_distribution == 'zipfian' or
+           (workload == 'b' and config.key_distribution == 'latest'),
+           'KEY_DISTRIBUTION must be uniform or zipfian (also latest for B)')
+    assert(config.zipf_theta < 1, 'ZIPF_THETA must be in [0, 1)')
+    assert(config.hotset_size > 0 and config.hotset_size <= 1, 'HOTSET_SIZE must be in (0, 1]')
+    assert(config.checkpoint_mode == 'auto' or config.checkpoint_mode == 'off',
+           'CHECKPOINT_MODE must be auto or off')
     if workload == 'b' then
         config.writers = option('WRITERS', 4, 0)
         config.readers = option('READERS', 4, 0)
@@ -61,14 +74,100 @@ function M.config(workload, args)
         config.workers = option('WORKERS', 8, 1)
     end
     for _, name in ipairs({'num_keys', 'value_size', 'vinyl_memory', 'vinyl_cache',
-                          'batch_size', 'workers', 'writers', 'readers'}) do
+                          'batch_size', 'workers', 'writers', 'readers', 'checkpoint_interval'}) do
         local value = config[name]
         if value ~= nil then
             assert(value == math.floor(value) and value <= 9007199254740991,
                    name .. ' must be an exactly representable integer <= 2^53-1')
         end
     end
+    if config.checkpoint_mode == 'off' then config.checkpoint_interval = 0 end
+
+    local defaults = {
+        a = {read = 0.5, update = 0.5},
+        b = {read = 0.5, insert = 0.5},
+        c = {delete = 0.3, insert = 0.2, scan = 0.3, read = 0.2},
+    }
+    config.mix_mode = 'ratio'
+    if workload == 'b' and os.getenv('READ_RATIO') == nil and os.getenv('INSERT_RATIO') == nil then
+        config.mix_mode = 'dedicated'
+    else
+        local total = 0
+        for operation, default in pairs(defaults[workload]) do
+            local name = operation .. '_ratio'
+            config[name] = option(name:upper(), default, 0)
+            assert(config[name] <= 1, name .. ' must be in [0, 1]')
+            total = total + config[name]
+        end
+        assert(math.abs(total - 1) <= 1e-9, 'operation ratios must sum to 1')
+        for operation in pairs(defaults[workload]) do
+            local name = operation .. '_ratio'
+            config[name] = config[name] / total
+        end
+    end
     return config
+end
+
+function M.operation_selector(config, operations)
+    local choices, total = {}, 0
+    for _, operation in ipairs(operations) do
+        local ratio = config[operation .. '_ratio']
+        if ratio > 0 then
+            total = total + ratio
+            choices[#choices + 1] = {operation = operation, limit = total}
+        end
+    end
+    return function()
+        local u = math.random() * total
+        for _, choice in ipairs(choices) do
+            if u < choice.limit then return choice.operation end
+        end
+        return choices[#choices].operation
+    end
+end
+
+-- Avoid cancellation in the Zipfian formula when theta is close to one.
+local function expm1(x)
+    if math.abs(x) < 1e-5 then return x * (1 + x * (0.5 + x * (1 / 6 + x / 24))) end
+    return math.exp(x) - 1
+end
+
+local function log1p(x)
+    if math.abs(x) < 1e-5 then return x * (1 + x * (-0.5 + x * (1 / 3 - x / 4))) end
+    return math.log(1 + x)
+end
+
+function M.key_generator(config)
+    local theta, distribution = config.zipf_theta, config.key_distribution
+    local alpha = 1 / (1 - theta)
+    local zeta_2 = 1 + 0.5 ^ theta
+    local previous_n, zeta, eta
+    return function(max_key)
+        local n = math.max(1, math.floor(max_key * config.hotset_size))
+        local offset = config.workload == 'b' and max_key - n or 0
+        if distribution == 'latest' then
+            if math.random() < 0.8 then
+                return offset + math.random(math.max(1, math.floor(n * 0.99)), n)
+            end
+            return offset + math.random(1, n)
+        end
+        if distribution == 'uniform' or theta == 0 then return offset + math.random(1, n) end
+        if n == 1 then return offset + 1 end
+        local u = math.random()
+        if n == 2 then return offset + (u * zeta_2 < 1 and 1 or 2) end
+        if n ~= previous_n then
+            -- Euler-Maclaurin approximation, as in the original workload A.
+            zeta = expm1((1 - theta) * math.log(n)) / (1 - theta) +
+                   0.5 * (1 + n ^ (-theta)) + theta / 12 * (1 - n ^ (-theta - 1))
+            eta = -expm1((1 - theta) * math.log(2 / n)) / (1 - zeta_2 / zeta)
+            previous_n = n
+        end
+        local uz = u * zeta
+        if uz < 1 then return offset + 1 end
+        if uz < zeta_2 then return offset + 2 end
+        local key = 1 + math.floor(n * math.exp(log1p(eta * (u - 1)) * alpha))
+        return offset + math.min(n, math.max(1, key))
+    end
 end
 
 function M.value_generator(size)

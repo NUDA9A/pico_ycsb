@@ -4,8 +4,8 @@
 -- (modeled after RocksDB deleterandom + readseq)
 --
 -- Phase 1 (load): insert N keys uniformly.
--- Worker iteration chooses: 30% delete batch, 20% replace batch,
--- 30% one range scan, 20% read batch. These are not operation ratios.
+-- Default mix: 30% DELETE, 20% REPLACE, 30% SCAN, 20% GET.
+-- Each branch performs BATCH_SIZE operations; scans remain independent requests.
 --
 -- Dataset: NUM_KEYS rows initially (default: 2M × scale), VALUE_SIZE bytes per value.
 --
@@ -37,7 +37,7 @@ box.cfg{
     log       = 'picodata.log',
     log_level = 'info',
     checkpoint_count    = 2,
-    checkpoint_interval = 600,
+    checkpoint_interval = config.checkpoint_interval,
     vinyl_cache         = config.vinyl_cache,
     vinyl_memory        = config.vinyl_memory,
 }
@@ -67,6 +67,8 @@ local space = box.space.bench_c
 -------------------------------------------------------------------------------
 
 local random_value = benchmark.value_generator(config.value_size)
+local random_key = benchmark.key_generator(config)
+local next_operation = benchmark.operation_selector(config, {'delete', 'insert', 'scan', 'read'})
 
 -------------------------------------------------------------------------------
 -- Initial load (if needed)
@@ -118,17 +120,17 @@ benchmark.event('setup', 'end')
 local next_new_key = NUM_KEYS + 1
 
 local function worker(stats)
-    local op = math.random()
-    if op < 0.30 then
+    local op = next_operation()
+    if op == 'delete' then
         benchmark.transaction(stats, function()
             for _ = 1, BATCH_SIZE do
-                local key = math.random(1, next_new_key - 1)
+                local key = random_key(next_new_key - 1)
                 stats.op_attempts = stats.op_attempts + 1
                 space:delete(key)
             end
             return {deletes = BATCH_SIZE}
         end)
-    elseif op < 0.50 then
+    elseif op == 'insert' then
         local base = next_new_key
         next_new_key = next_new_key + BATCH_SIZE
         benchmark.transaction(stats, function()
@@ -139,22 +141,24 @@ local function worker(stats)
             end
             return {inserts = BATCH_SIZE}
         end)
-    elseif op < 0.80 then
+    elseif op == 'scan' then
         benchmark.operations(stats, function()
-            local start_key = math.random(1, math.max(1, next_new_key - SCAN_LENGTH))
-            local count = 0
-            stats.op_attempts = stats.op_attempts + 1
-            for _, tuple in space:pairs(start_key, {iterator = 'GE'}) do
-                count = count + 1
-                if count >= SCAN_LENGTH then break end
+            for _ = 1, BATCH_SIZE do
+                local start_key = random_key(math.max(1, next_new_key - SCAN_LENGTH))
+                local count = 0
+                stats.op_attempts = stats.op_attempts + 1
+                for _, tuple in space:pairs(start_key, {iterator = 'GE'}) do
+                    count = count + 1
+                    if count >= SCAN_LENGTH then break end
+                end
+                stats.scans = stats.scans + 1
+                stats.scan_rows = stats.scan_rows + count
             end
-            stats.scans = stats.scans + 1
-            stats.scan_rows = stats.scan_rows + count
         end)
     else
         benchmark.operations(stats, function()
             for _ = 1, BATCH_SIZE do
-                local key = math.random(1, next_new_key - 1)
+                local key = random_key(next_new_key - 1)
                 stats.op_attempts = stats.op_attempts + 1
                 local tuple = space:get(key)
                 stats.reads = stats.reads + 1

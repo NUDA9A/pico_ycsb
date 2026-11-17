@@ -1,233 +1,142 @@
 # pico_ycsb
 
-Нагрузки в стиле YCSB для [Tarantool/Vinyl](https://www.tarantool.io/).
-Исходный проект использовался в статье
+YCSB-style benchmark suite for [Tarantool](https://www.tarantool.io/) Vinyl,
+the LSM-tree storage engine.
+
+Used to produce the benchmark results in
 [Как мы пересобрали сборку мусора в Vinyl](https://kostja.github.io/tarantool/vinyl/2026/03/11/vinyl-compaction-scheduler.html).
 
-Этот README описывает **текущую реализацию**, ограничения и оставшиеся задачи
-подготовки к исследованию super-0.
+## Workloads
 
-## Состояние подготовки
+| Workload | Default pattern | Purpose |
+|----------|-----------------|---------|
+| **A** | 50% GET / 50% REPLACE, Zipfian | Hot-key contention and overlapping runs |
+| **B** | 4 append writers + 4 readers, latest-biased reads | Growing dataset and non-overlapping runs |
+| **C** | 30% DELETE / 20% REPLACE / 30% SCAN / 20% GET, uniform | Tombstones and range scans |
 
-Изменения этапа 1 и первой части этапа 2 (параметры ресурсов и параллелизма)
-внесены в код, но **тесты и нагрузки ещё не запускались**.
-Проверка на целевой сборке Tarantool будет проводиться после подготовки проекта.
-Полноценный baseline требует отдельного согласования.
+A uses mixed transactions. B/C batch writes in transactions; GETs and scans
+remain independent requests. Inserts in B/C currently use `space:replace()`.
+Each C batch contains `BATCH_SIZE` operations; each scan returns up to 200 rows.
 
-| Требование плана | Сейчас | Что осталось |
-|---|---|---|
-| Счётчики во время работы | A/B/C публикуют успешные операции после завершения; результаты явной транзакции — только после commit | Проверить на целевой сборке |
-| Попытки, ошибки, откаты | Отдельные op_attempts, tx_attempts/committed/failed, errors, rollback_calls/errors | Нет автоматических retries; rollback_calls означает вызовы очистки, а не число фактических откатов движка |
-| Setup / warmup / measurement | Общий модуль benchmark.lua, WARMUP_SECONDS, снимки счётчиков на границах | Проверить переходы фаз и накладные расходы |
-| Интервальные OPS/TPS | Лог каждые 10 с и последний неполный интервал; фактическое время | CSV — этап 3 |
-| Dump/compaction и прочие накопительные метрики | Дельты за measurement; postrun отдельно | Не являются причинной атрибуцией I/O операциям measurement |
-| Checkpoint | Сохранены checkpoint_interval=600, checkpoint_count=2 и snapshot после фактической загрузки | Параметризация и T6 позже; автоматические checkpoints пока видны только в штатном логе Tarantool |
-| Latency p50/p95/p99, logical_write_bytes, новый WA | Не реализованы | Этап 3 |
-| RAM | Начальные, интервальные и конечные доступные показатели Vinyl | Средний/пиковый RSS, усреднение памяти — этап 3 |
-| JSON/CSV, SHA, run_id/output_dir | Только picodata.log | Этап 3, включая защиту результатов от перезаписи |
-| Размер данных, память, параллелизм, время | Независимые NUM_KEYS, VALUE_SIZE, VINYL_MEMORY/VINYL_CACHE, BATCH_SIZE, WORKERS или WRITERS/READERS, DURATION_SECONDS/WARMUP_SECONDS; общий разбор и лог конфигурации | Проверить на целевой сборке |
-| Смеси и распределения ключей | Исходные вероятности, Zipfian в A и исходные правила B/C | Следующая часть этапа 2 |
-| T1/T3/T6, seed и воспроизводимость | Не завершены | Этапы 4–5 |
-
-## Архитектура и нагрузки
-
-Каждый `vinyl_workload_*.lua` настраивает Tarantool, создаёт пространство Vinyl
-с одним первичным индексом и загружает данные. В нём остаются генераторы ключей
-и один шаг worker. `benchmark.lua` отвечает за разбор параметров, общий генератор
-строк значений, учёт, фазы и отчёты.
-Отдельного reporter fiber больше нет: отчёты формирует управляющий fiber.
-
-| Нагрузка | Поведение с параметрами по умолчанию |
-|---|---|
-| A | 8 workers; выбор GET/REPLACE с вероятностями 50/50, Zipfian; batch в явной транзакции; txn_isolation='snapshot' |
-| B | 4 writer с пакетами по 200 REPLACE новых ключей и 4 reader с пакетами отдельных GET; 80% чтений из последнего 1% диапазона, 20% uniform |
-| C | 8 workers; на каждой итерации выбор: 30% пакет DELETE, 20% пакет REPLACE, 30% один scan до 200 строк, 20% пакет GET; batch=50 |
-
-B не гарантирует 50/50 завершённых операций: скорость writer и reader различается.
-В C вероятности относятся к веткам, а scan содержит одну операцию вместо batch.
-В B/C названные inserts фактически выполняются через `space:replace()`.
-Настоящий режим INSERT-only и настройка долей операций ещё не реализованы.
-В A результат приближённого Zipfian-генератора ограничен NUM_KEYS, в том числе
-для малых наборов данных.
-В B можно задать READERS=0 или WRITERS=0, но хотя бы один worker должен остаться.
-Отключение readers оставляет запись через REPLACE, а не реализует режим INSERT-only.
-
-`vinyl_dict_footprint.lua` — отдельный эксперимент со словарями; в этот этап не входит.
-`run_si_bench.sh` — отдельный запуск с инструментированием snapshot isolation;
-для режима zero требуется экспортированный символ `vinyl_set_conflict_window`.
-
-## Параметры и запуск
-
-Примеры ниже — инструкции для последующего запуска, а не выполненные проверки.
-Нужна совместимая сборка Tarantool с Vinyl; поддержку настроек и полей статистики
-необходимо проверить на выбранной версии. Отсутствующие поля метрик выводятся как `N/A`.
+## Quick start
 
 ```bash
-tarantool /path/to/pico_ycsb/vinyl_workload_a.lua [minutes] [scale] [batch_size]
-tarantool /path/to/pico_ycsb/vinyl_workload_b.lua [minutes] [scale]
-tarantool /path/to/pico_ycsb/vinyl_workload_c.lua [minutes] [scale]
+./run_all.sh /path/to/tarantool my_test
 ```
 
-`benchmark.lua` должен находиться рядом с workload. Можно запускать скрипт по
-абсолютному пути из отдельного рабочего каталога: данные и `picodata.log`
-создаются в рабочем каталоге. `run_si_bench.sh` копирует туда также общий модуль.
+Results go to `/var/opt/bench/my_test_{a,b,c}/picodata.log`.
+**Use a new prefix: launch scripts delete existing directories for that prefix.**
 
-Общие переменные окружения разбираются в `benchmark.config()` до `box.cfg()`:
+## Usage
 
-| Переменная | Единицы и допустимые значения | По умолчанию |
-|---|---|---|
-| NUM_KEYS | Целое число начальных ключей, ≥ 1 | 2 000 000 × scale |
-| VALUE_SIZE | Целый размер строки value в байтах, ≥ 1 | 90 |
-| VINYL_MEMORY | Целое число байт, > 0; дополнительно действуют ограничения Tarantool | 4 MiB × scale |
-| VINYL_CACHE | Целое число байт, ≥ 0 | 0 |
-| BATCH_SIZE | Целое число операций в batch, ≥ 1 | A: max(2, floor(scale × log10(scale) + 0.5)); B: 200; C: 50 |
-| DURATION_SECONDS | Конечное число секунд выдачи работы measurement, > 0; допускается дробное | Старое правило длительности по scale, переведённое в секунды |
-| WARMUP_SECONDS | Конечное число секунд прогрева, ≥ 0; допускается дробное | 0 |
-| WORKERS | Только A/C: целое число workers, ≥ 1 | 8 |
-| WRITERS | Только B: целое число writer, ≥ 0 | 4 |
-| READERS | Только B: целое число reader, ≥ 0; сумма с WRITERS > 0 | 4 |
+```text
+./run_all.sh <tarantool_binary> <prefix> [scale]
+```
 
-Числовые значения должны быть конечными; целочисленные параметры также ограничены
-2^53−1 для точного представления в Lua number. Некорректное значение, включая пустую
-строку в используемой переменной окружения, вызывает ошибку до настройки БД.
-Проверка чисел не заменяет ограничений выбранной сборки Tarantool на память и размер
-tuple. Суффиксы единиц вроде `64MiB` не поддерживаются: указывайте число байт.
+`scale` defaults to 10 and sets defaults for dataset size, memory and runtime.
 
-Существующие позиционные аргументы сохранены:
+| Scale | Keys | Approximate data size | Measurement duration |
+|-------|------|-----------------------|----------------------|
+| 1     | 2M   | 200 MB                | 1 minute             |
+| 10    | 20M  | 2 GB                  | 5 minutes            |
+| 100   | 200M | 20 GB                 | 25 minutes           |
 
-- `[minutes]` имеет приоритет над DURATION_SECONDS и переводится в секунды.
-- `[scale]` — положительное число, по умолчанию 10. Оно задаёт только значения
-  по умолчанию: NUM_KEYS, VINYL_MEMORY и прочие явные настройки от него независимы.
-  Производные целочисленные параметры также проходят проверку.
-- `[batch_size]` в A имеет приоритет над BATCH_SIZE. В B/C этого аргумента нет.
-- Отсутствующий или пустой позиционный аргумент (`""`) позволяет использовать
-  соответствующую переменную окружения; если её нет — прежнее значение по умолчанию.
-  Некорректный непустой аргумент вызывает ошибку, а не заменяется значением по умолчанию.
-- Неиспользуемые настройки не разбираются: например, WORKERS не влияет на B,
-  а DURATION_SECONDS игнорируется при явно заданном `[minutes]`.
-
-Смеси операций и распределения ключей остаются исходными. LOAD_BATCH=5000,
-SCAN_LENGTH=200 в C, ZIPF_THETA=0.99 в A. Checkpoint по-прежнему имеет interval=600
-секунд и count=2. Значения всех разобранных параметров записываются в `picodata.log`
-строкой `Configuration:` перед setup; для B указываются writers, readers и их сумма workers.
-
-| Scale | Ключей | Примерный размер данных | Measurement по умолчанию |
-|---|---|---|---|
-| 1 | 2M | 200 MB | 1 минута |
-| 10 | 20M | 2 GB | 5 минут |
-| 100 | 200M | 20 GB | 25 минут |
-
-Таблица выше относится к запуску без переопределений, с VALUE_SIZE=90.
-NUM_KEYS и VINYL_MEMORY можно менять отдельно, не меняя scale. Реальное потребление
-RAM зависит также от структур Vinyl, а не только от NUM_KEYS × VALUE_SIZE.
+## Running individual workloads
 
 ```bash
-NUM_KEYS=100000 VALUE_SIZE=90 VINYL_MEMORY=67108864 WORKERS=4 BATCH_SIZE=16 \
-    DURATION_SECONDS=60 WARMUP_SECONDS=10 \
-    tarantool /path/to/pico_ycsb/vinyl_workload_a.lua
-
-# Здесь позиционные аргументы выбирают 60 секунд и batch=2 вместо значений из env.
-DURATION_SECONDS=120 BATCH_SIZE=64 \
-    tarantool /path/to/pico_ycsb/vinyl_workload_a.lua 1 1 2
-
-./run_all.sh /path/to/tarantool my_test [scale]
+tarantool vinyl_workload_a.lua [minutes] [scale] [batch_size]
+tarantool vinyl_workload_b.lua [minutes] [scale]
+tarantool vinyl_workload_c.lua [minutes] [scale]
 ```
 
-`run_all.sh` последовательно запускает A/B/C и извлекает блок FINAL REPORT.
-Оба shell-скрипта передают переменные окружения без изменений и показывают заданные
-переопределения; `<default>` означает, что значение будет вычислено Lua-скриптом.
-В частности, DURATION_SECONDS применяется и при запуске через shell-скрипты.
-Результаты размещаются в `/var/opt/bench/my_test_{a,b,c}/`.
-**Оба shell-скрипта всё ещё удаляют существующие каталоги результатов своих запусков.**
-Уникальные каталоги и отказ от перезаписи запланированы на этап 3.
+Keep `benchmark.lua` beside the scripts and use a fresh working directory.
+Positional arguments override environment settings; `""` skips an argument.
 
-## Фазы и checkpoint
+## Configuration
 
-1. **Setup:** создание схемы и загрузка, если текущего числа строк недостаточно.
-   Существующий `box.snapshot()` вызывается только после фактической загрузки.
-   При пропуске загрузки snapshot также пропускается, как и раньше.
-   Нового ожидания завершения compaction нет.
-2. **Warmup:** те же workers и настройки, что в measurement. При 0 секунд
-   записывается `phase=warmup event=skipped`. При положительном значении по окончании
-   времени прекращается выдача новых batch и завершаются начатые операции.
-3. **Measurement:** после завершения warmup снимаются начальные накопительные
-   счётчики. Состояние генератора случайных чисел и выделения новых ключей сохраняется.
-   Snapshot между фазами не вызывается. После deadline workers заканчивают текущие
-   batch; конечный снимок снимается после их join. Actual duration включает это
-   завершение, requested duration и overrun выводятся отдельно.
-4. **Postrun:** только наблюдение за естественными фоновыми задачами после конечного
-   снимка, без нового snapshot или принудительной compaction. Окно — до 60 секунд;
-   отсутствие активных задач и изменений tasks_completed/dump_out/compaction_out
-   в течение 1 секунды отмечается как `idle_observed`. Другие исходы: `timeout` и
-   `unavailable` (нет нужной статистики). Дельты выводятся отдельно с phase=postrun.
-   Это не доказательство сброса всех данных из L0 или завершения всех будущих задач.
+Environment variables override defaults independently of `scale` and are
+validated before `box.cfg()`. Resolved values are logged as `Configuration:`.
 
-События фаз и явного setup checkpoint содержат monotonic и realtime в секундах.
-Границы расчёта скоростей указаны в `clock_start`, `interval_start/interval_end`;
-это время снимков счётчиков, а не время печати строк лога.
+| Variable | Default / meaning |
+|----------|-------------------|
+| `NUM_KEYS` | Initial keys: `2000000 * scale` |
+| `VALUE_SIZE` | Value bytes: `90` |
+| `VINYL_MEMORY` | Bytes: `4 MiB * scale` |
+| `VINYL_CACHE` | Bytes: `0` |
+| `BATCH_SIZE` | A: `max(2, floor(scale * log10(scale) + 0.5))`; B: `200`; C: `50` |
+| `WORKERS` | A/C workers: `8` |
+| `WRITERS`, `READERS` | B workers: `4` each; either may be zero, both cannot |
+| `DURATION_SECONDS` | Measurement duration from the scale table |
+| `WARMUP_SECONDS` | `0` |
+| `KEY_DISTRIBUTION` | `uniform` / `zipfian` / `latest` (B-only); defaults: A `zipfian`, B `latest`, C `uniform` |
+| `ZIPF_THETA` | `0.99`, in `[0, 1)` |
+| `HOTSET_SIZE` | Eligible fraction of the key range, in `(0, 1]`: `1` |
+| `CHECKPOINT_MODE` | `auto` or `off`; default `auto` |
+| `CHECKPOINT_INTERVAL` | Native daemon interval in seconds: `600`; `off` forces `0` |
 
-Автоматические checkpoints продолжают работать штатно и не получают отдельного
-эксклюзивного окна. Workers специально ради них не останавливаются, планировщик
-Vinyl не меняется. Весь учтённый во время measurement I/O, в том числе checkpoint,
-включается в её результат. Вычитание начальных счётчиков исключает уже учтённый
-setup/warmup, но поздний dump их данных может попасть в measurement.
+Sizes use bytes without suffixes. Counts and byte sizes must be integers.
 
-## Определения метрик
+Hotsets select the first fraction of keys in A/C and the most recent fraction
+in B (at least one key). They affect point operations and scan starts, excluding
+loading/appends. `latest` reads target the last 1% of that range 80% of the time.
 
-- **OPS** = успешно завершённые логические операции / actual duration. Для явной
-  транзакции результаты всех её операций публикуются только после успешного commit.
-  GET без найденной записи и DELETE отсутствующего ключа считаются завершёнными
-  операциями. `read_miss` учитывается отдельно. Один завершённый scan — одна операция;
-  `scan_rows` не прибавляется к OPS.
-- **TPS (explicit)** = успешные явные `box.commit()` / actual duration. В A это
-  смешанные batch, в B/C — batch записей. Отдельные GET и scans не объединяются
-  искусственно в транзакции и не входят в этот TPS.
-- **op_attempts** увеличивается перед вызовом операции, включая вызовы в будущих
-  откатившихся транзакциях. Невыполненный остаток batch попытками не считается.
-- **tx_attempts/tx_committed/tx_failed** относятся только к явным транзакциям.
-  **errors** — пойманные ошибки транзакций или самостоятельных операций.
-  **rollback_calls** — вызовы очистки после неуспешной явной транзакции; движок мог
-  уже откатить её самостоятельно. Ошибка очистки увеличивает **rollback_errors** и
-  прерывает запуск. Автоматических повторных попыток нет.
-- **Vinyl delta:** dump/compaction counts и input/output bytes, bloom, get/read bytes,
-  scheduler, доступные cache/dictionary counters вычисляются как конец минус начало.
-  `tasks_completed` относится к dump и compaction вместе; `compaction_count` —
-  отдельный счётчик индекса. Уменьшение накопительного счётчика прерывает отчёт.
-- **Vinyl start/end/current:** runs, ranges, disk_bytes, memory и другие gauges
-  сохраняются как значения, не как разности. Отсутствующие поля — `N/A`, не ноль.
-- **legacy_wa** = (Δdump_out + Δcompaction_out) / Δdump_in; при нулевом или
-  отсутствующем знаменателе — `N/A`. Это прежняя формула на новом временном окне,
-  а не целевой WA через logical_write_bytes. WAL и физические записи ОС не включены.
-- **Read amplification** = Δdisk_read_bytes / Δget_bytes, либо `N/A`.
-- **Space amplification (estimate)** = disk_bytes в конце measurement /
-  (число строк × (VALUE_SIZE + 10)). При VALUE_SIZE=90 получается прежняя оценка
-  100 байт на запись. Прибавка 10 байт для ключа и tuple — приблизительная, не точная
-  сериализация. Генератор сохраняет символы a–z и собирает длинные строки частями,
-  чтобы размер value не превращался в неограниченный список аргументов `unpack()`.
+Checkpoint settings control the native daemon; Vinyl schedules background work
+normally. `off` retains the snapshot after initial loading.
 
-Интервальные строки содержат дельты счётчиков и фактические OPS/TPS примерно каждые
-10 секунд, включая окончание неполного интервала. Попытка и commit одной транзакции
-могут попасть в соседние интервалы. Итоговый FINAL REPORT относится только к measurement.
-Неожиданная ошибка worker или сбора отчёта прерывает запуск; обычные ошибки запросов
-считаются и отражаются в результате. Проверять нужно полный блок до END REPORT.
+### Operation ratios
 
-## Ограничения и будущие проверки
+Set fractions in `[0, 1]`, summing to 1 for the selected workload:
 
-Повторный запуск не восстанавливает исходный dataset. Загрузчики используют число
-строк, а не проверку диапазона ключей. В B после откатов возможны пропуски ключей;
-в C next_new_key при перезапуске снова равен NUM_KEYS+1. Поэтому повторное использование
-каталога пока нельзя считать воспроизводимым baseline. Внутри одного запуска между
-warmup и measurement эти счётчики ключей не сбрасываются.
-Изменение NUM_KEYS или VALUE_SIZE также не пересоздаёт существующие записи:
-NUM_KEYS задаёт цель начальной загрузки, VALUE_SIZE — размер новых значений.
-При смешанных размерах старых и новых записей оценка space amplification неточна.
+| Workload | Supported variables and defaults |
+|----------|----------------------------------|
+| A | `READ_RATIO=0.5 UPDATE_RATIO=0.5` |
+| B | `READ_RATIO=0.5 INSERT_RATIO=0.5` (opt-in) |
+| C | `DELETE_RATIO=0.3 INSERT_RATIO=0.2 SCAN_RATIO=0.3 READ_RATIO=0.2` |
 
-Отдельные unit/mock-тесты в рамках этой подготовки не добавляются.
-До её завершения выполняется только статическая сверка кода, diff и документации.
-Проверки запуском A/B/C, включая статистику, границы фаз и работу из другого
-каталога, откладываются до полной подготовки проекта. Baseline требует отдельного
-согласования. Никакие тесты и нагрузки пока не запускались.
+A selects operations; B/C select equal-sized batches. Ratios describe the
+requested mix; successful proportions may differ. B defaults to separate
+writers/readers with no guaranteed 50/50 throughput. Setting either B ratio
+switches to `WRITERS + READERS` mixed workers. Only the selected workload's
+ratio variables apply; set every ratio needed to make their sum 1.
+
+```bash
+# Overwrites of a small hotset, independent dataset and memory sizes.
+NUM_KEYS=100000 VALUE_SIZE=90 VINYL_MEMORY=67108864 \
+    READ_RATIO=0 UPDATE_RATIO=1 HOTSET_SIZE=0.01 KEY_DISTRIBUTION=uniform \
+    DURATION_SECONDS=60 WARMUP_SECONDS=10 tarantool vinyl_workload_a.lua
+```
+
+Launch scripts inherit these variables; use individual scripts for different
+A/B/C settings.
+
+## Metrics
+
+Every 10 seconds and for the final partial interval, the log reports:
+
+- **OPS:** successfully completed operations per second.
+- **TPS (explicit):** successful explicit commits per second.
+- Attempts, failures, errors and rollback calls.
+- Vinyl dump/compaction I/O, bloom/cache statistics and memory gauges.
+
+Phases: **setup → warmup → measurement → postrun**. Final counters exclude
+setup/warmup; rates use actual elapsed time, including batch completion.
+Postrun observes background work separately for up to 60 seconds without
+forcing a flush. A scan counts as one operation regardless of returned rows.
+
+The final report includes `legacy_wa = (Δdump_out + Δcompaction_out) / Δdump_in`,
+read amplification and estimated space amplification (`VALUE_SIZE + 10` bytes
+per row). Unavailable ratios are `N/A`. Measurement I/O includes checkpoints
+and may include delayed warmup dumps.
+
+## Requirements and status
+
+- A compatible Tarantool build with Vinyl support and enough disk space.
+- Reused directories keep existing tuples; B/C key allocation on restart
+  still needs work.
+
+Planned: runtime validation, latency percentiles, logical-write-based WA, RSS,
+JSON/CSV export, reproducible seeds, true INSERT-only and forced-checkpoint scenarios.
 
 ## License
 
-BSD-2-Clause.
+BSD-2-Clause

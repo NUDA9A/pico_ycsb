@@ -5,8 +5,8 @@
 --
 -- Write path: sequential inserts at the end of the key space
 -- (monotonically increasing keys, like timestamps).
--- Read path: 80% reads favor recent data (latest 1%), 20% uniform.
--- Mix: WRITERS and READERS (4 each by default); ratios depend on throughput.
+-- Default read path: 80% reads favor recent data (latest 1%), 20% uniform.
+-- Default mix: WRITERS and READERS (4 each); ratios depend on throughput.
 --
 -- Dataset: NUM_KEYS rows initially (default: 2M × scale), then keeps growing.
 --
@@ -37,7 +37,7 @@ box.cfg{
     log       = 'picodata.log',
     log_level = 'info',
     checkpoint_count    = 2,
-    checkpoint_interval = 600,
+    checkpoint_interval = config.checkpoint_interval,
     vinyl_cache         = config.vinyl_cache,
     vinyl_memory        = config.vinyl_memory,
 }
@@ -68,6 +68,7 @@ local space = box.space.bench_b
 -------------------------------------------------------------------------------
 
 local random_value = benchmark.value_generator(config.value_size)
+local random_key = benchmark.key_generator(config)
 
 -------------------------------------------------------------------------------
 -- Initial load (if needed)
@@ -137,13 +138,7 @@ local function reader(stats)
         for _ = 1, BATCH_SIZE do
             local max_key = next_key - 1
             if max_key < 1 then return end
-            local key
-            if math.random() < 0.8 then
-                local recent_start = math.max(1, math.floor(max_key * 0.99))
-                key = math.random(recent_start, max_key)
-            else
-                key = math.random(1, max_key)
-            end
+            local key = random_key(max_key)
             stats.op_attempts = stats.op_attempts + 1
             local tuple = space:get(key)
             stats.reads = stats.reads + 1
@@ -154,7 +149,15 @@ end
 
 math.randomseed(tonumber(clock.realtime64() % 2147483647))
 local workers = {}
-for _ = 1, NUM_WRITERS do workers[#workers + 1] = writer end
-for _ = 1, NUM_READERS do workers[#workers + 1] = reader end
+if config.mix_mode == 'dedicated' then
+    for _ = 1, NUM_WRITERS do workers[#workers + 1] = writer end
+    for _ = 1, NUM_READERS do workers[#workers + 1] = reader end
+else
+    local next_operation = benchmark.operation_selector(config, {'read', 'insert'})
+    local function mixed(stats)
+        if next_operation() == 'read' then reader(stats) else writer(stats) end
+    end
+    for i = 1, config.workers do workers[i] = mixed end
+end
 benchmark.run(space, workers, config)
 os.exit(0)

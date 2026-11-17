@@ -22,7 +22,9 @@ echo "Binary: $($TARANTOOL --version | head -1)"
 echo "Scale: $SCALE"
 echo "Environment overrides (WORKERS: A/C; WRITERS/READERS: B):"
 for parameter in NUM_KEYS VALUE_SIZE VINYL_MEMORY VINYL_CACHE BATCH_SIZE \
-                 DURATION_SECONDS WARMUP_SECONDS WORKERS WRITERS READERS; do
+                 DURATION_SECONDS WARMUP_SECONDS WORKERS WRITERS READERS \
+                 READ_RATIO UPDATE_RATIO INSERT_RATIO DELETE_RATIO SCAN_RATIO \
+                 KEY_DISTRIBUTION ZIPF_THETA HOTSET_SIZE CHECKPOINT_MODE CHECKPOINT_INTERVAL; do
     echo "${parameter}: ${!parameter-<default>}"
 done
 echo "Resolved parameters are recorded as Configuration in picodata.log."
