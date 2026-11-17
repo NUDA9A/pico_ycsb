@@ -87,9 +87,16 @@ function M.config(workload, args)
            'KEY_DISTRIBUTION must be uniform or zipfian (also latest for B)')
     assert(config.zipf_theta < 1, 'ZIPF_THETA must be in [0, 1)')
     assert(config.hotset_size > 0 and config.hotset_size <= 1, 'HOTSET_SIZE must be in (0, 1]')
-    assert(config.checkpoint_mode == 'auto' or config.checkpoint_mode == 'off',
-           'CHECKPOINT_MODE must be auto or off')
+    assert(config.checkpoint_mode == 'auto' or config.checkpoint_mode == 'off' or
+           config.checkpoint_mode == 'forced', 'CHECKPOINT_MODE must be auto, off or forced')
+    if config.checkpoint_mode == 'forced' then
+        assert(config.checkpoint_interval > 0 and config.checkpoint_interval < duration,
+               'forced CHECKPOINT_INTERVAL must be positive and shorter than measurement')
+    end
     if workload == 'b' then
+        config.write_mode = os.getenv('WRITE_MODE') or 'replace'
+        assert(config.write_mode == 'replace' or config.write_mode == 'insert',
+               'WRITE_MODE must be replace or insert')
         config.writers = option('WRITERS', 4, 0)
         config.readers = option('READERS', 4, 0)
         config.workers = config.writers + config.readers
@@ -106,6 +113,7 @@ function M.config(workload, args)
         end
     end
     if config.checkpoint_mode == 'off' then config.checkpoint_interval = 0 end
+    config.native_checkpoint_interval = config.checkpoint_mode == 'auto' and config.checkpoint_interval or 0
 
     local defaults = {
         a = {read = 0.5, update = 0.5},
@@ -210,14 +218,14 @@ function M.value_generator(size)
     end
 end
 
-function M.event(phase, event)
+function M.event(phase, event, details)
     local monotonic, realtime = clock.monotonic(), clock.realtime()
-    log.info('phase=%s event=%s monotonic=%.6f realtime=%.6f',
-             phase, event, monotonic, realtime)
     if output then
         output.events[#output.events + 1] = {phase = phase, event = event,
-                                           monotonic = monotonic, realtime = realtime}
+                                           monotonic = monotonic, realtime = realtime, details = details}
     end
+    log.info('phase=%s event=%s monotonic=%.6f realtime=%.6f%s',
+             phase, event, monotonic, realtime, details and ' details=' .. json.encode(details) or '')
 end
 
 function M.snapshot()
@@ -234,6 +242,8 @@ function M.new_stats()
         tx_attempts = 0, tx_committed = 0, tx_failed = 0,
         rollback_calls = 0, rollback_errors = 0, errors = 0,
         logical_write_bytes = 0,
+        forced_checkpoints_started = 0, forced_checkpoints_completed = 0,
+        forced_checkpoints_failed = 0, forced_checkpoints_skipped = 0,
     }
 end
 
@@ -529,7 +539,7 @@ local function report_interval(phase, before, after, rss)
     log.info('phase=%s vinyl_current %s %s', phase,
              fields_text(after.gauges, index_gauges), fields_text(after.gauges, vinyl_gauges))
     local data = phase_result(phase, before, after, rss)
-    log.info('phase=%s wa=%s legacy_wa=%s rss_mean_bytes=%s rss_peak_sampled_bytes=%s',
+    log.info('phase=%s wa_uncompressed=%s legacy_wa=%s rss_mean_bytes=%s rss_peak_sampled_bytes=%s',
              phase, display(data.wa), display(data.legacy_wa),
              display(data.rss.mean_bytes), display(data.rss.peak_sampled_bytes))
     for _, kind in ipairs(LATENCY_KINDS) do
@@ -551,6 +561,67 @@ local function report_interval(phase, before, after, rss)
     assert(output.csv:write(table.concat(cells, ',') .. '\n'))
 end
 
+local function start_checkpoints(stats, started, seconds, on_error)
+    local interval = output.config.checkpoint_interval
+    local deadline = started + seconds
+    local last_tick = math.ceil(seconds / interval) - 1
+    local checkpoint = {phase = 'measurement', stop = false, done = false,
+                        wake = fiber.channel(1), finished = fiber.channel(1)}
+    output.checkpoint = checkpoint
+    local driver = fiber.new(function()
+        local ok, err = pcall(function()
+            local function skip(first, last)
+                if last < first then return end
+                local count = last - first + 1
+                stats.forced_checkpoints_skipped = stats.forced_checkpoints_skipped + count
+                M.event(checkpoint.phase, 'checkpoint_skipped', {count = count, first_id = first})
+            end
+            local tick = 1
+            while tick <= last_tick and not checkpoint.stop do
+                local scheduled = started + tick * interval
+                checkpoint.wake:get(math.max(0, scheduled - clock.monotonic()))
+                if checkpoint.stop or clock.monotonic() >= deadline then
+                    skip(tick, math.min(last_tick, math.floor((clock.monotonic() - started) / interval)))
+                    break
+                end
+                stats.forced_checkpoints_started = stats.forced_checkpoints_started + 1
+                M.event(checkpoint.phase, 'checkpoint_start', {id = tick, scheduled_monotonic = scheduled})
+                local saved, save_error = pcall(box.snapshot)
+                if saved then
+                    stats.forced_checkpoints_completed = stats.forced_checkpoints_completed + 1
+                else
+                    stats.forced_checkpoints_failed = stats.forced_checkpoints_failed + 1
+                end
+                M.event(checkpoint.phase, saved and 'checkpoint_end' or 'checkpoint_failed',
+                        {id = tick, scheduled_monotonic = scheduled,
+                         error = not saved and tostring(save_error) or nil})
+                if not saved then error('forced checkpoint failed: ' .. tostring(save_error)) end
+                -- Skip elapsed slots instead of issuing a burst of overdue snapshots.
+                local elapsed_tick = math.min(last_tick, math.floor((clock.monotonic() - started) / interval))
+                skip(tick + 1, elapsed_tick)
+                tick = math.max(tick, elapsed_tick) + 1
+            end
+        end)
+        if not ok then
+            checkpoint.error = tostring(err)
+            on_error(checkpoint.error)
+        end
+        checkpoint.finished_at = clock.monotonic()
+        checkpoint.done = true
+        checkpoint.finished:put(true)
+    end)
+    driver:name('forced_checkpoint')
+end
+
+local function stop_checkpoints()
+    local checkpoint = output.checkpoint
+    if checkpoint and not checkpoint.stop then
+        checkpoint.stop = true
+        checkpoint.wake:put(true, 0)
+    end
+    return checkpoint
+end
+
 function M.run_phase(space, stats, workers, phase, seconds)
     M.number(seconds, phase .. ' seconds', 0)
     assert(#workers > 0, 'at least one worker is required')
@@ -567,7 +638,7 @@ function M.run_phase(space, stats, workers, phase, seconds)
                     fiber.sleep(0)
                 end
             end)
-            if not ok then stop = true end
+            if not ok then stop = true; stop_checkpoints() end
             done:put({ok = ok, err = err})
         end)
         fibers[i]:set_joinable(true)
@@ -580,10 +651,14 @@ function M.run_phase(space, stats, workers, phase, seconds)
     local interval_rss = new_rss(before.time, before.gauges.rss_bytes)
     deadline = before.time + seconds
     log.info('phase=%s clock_start=%.6f deadline=%.6f', phase, before.time, deadline)
-    for _ = 1, #workers do gate:put(true) end
-
     -- The main fiber reports, so reporter failure cannot silently lose a fiber.
     local ok, err = pcall(function()
+        if phase == 'measurement' and output.config.checkpoint_mode == 'forced' then
+            start_checkpoints(stats, before.time, seconds, function(checkpoint_error)
+                failure, stop = checkpoint_error, true
+            end)
+        end
+        for _ = 1, #workers do gate:put(true) end
         local remaining = #workers
         local next_report = before.time + REPORT_INTERVAL
         local next_rss = before.time + RSS_INTERVAL
@@ -592,6 +667,7 @@ function M.run_phase(space, stats, workers, phase, seconds)
             local now = clock.monotonic()
             if now >= deadline and not stopping then
                 stop, stopping = true, true
+                stop_checkpoints()
                 M.event(phase, 'stop_requested')
             end
             local wake_at = math.min(next_report, next_rss)
@@ -620,6 +696,9 @@ function M.run_phase(space, stats, workers, phase, seconds)
         end
     end)
     stop = true
+    local checkpoint = stop_checkpoints()
+    -- Release any workers still waiting if phase startup failed.
+    for _ = 1, #workers do gate:put(true, 0) end
     for _, f in ipairs(fibers) do
         local joined, join_error = f:join()
         if not joined then failure = tostring(join_error) end
@@ -629,15 +708,21 @@ function M.run_phase(space, stats, workers, phase, seconds)
         error(failure or err)
     end
     local after = M.sample(space, stats)
+    if checkpoint then
+        checkpoint.phase = 'postrun'
+        checkpoint.wait_deadline = after.time + POSTRUN_TIMEOUT
+    end
+    M.event(phase, 'end')
     update_rss(rss, after.time, after.gauges.rss_bytes)
     update_rss(interval_rss, after.time, after.gauges.rss_bytes)
     report_interval(phase, previous, after, interval_rss)
-    M.event(phase, 'end')
     return phase_result(phase, before, after, rss, seconds), after
 end
 
 function M.postrun(space, stats, before)
     M.event('postrun', 'start')
+    local checkpoint = output.checkpoint
+    if checkpoint then checkpoint.wait_deadline = before.time + POSTRUN_TIMEOUT end
     local previous, current = before, before
     local reported = before
     local rss = new_rss(before.time, before.gauges.rss_bytes)
@@ -645,8 +730,10 @@ function M.postrun(space, stats, before)
     local quiet_since = before.time
     local status = 'timeout'
     while current.time - before.time < POSTRUN_TIMEOUT do
-        if current.gauges.tasks_inprogress == nil or
-           current.counters.tasks_completed == nil then
+        if checkpoint and checkpoint.error then status = 'checkpoint_failed'; break end
+        local available = current.gauges.tasks_inprogress ~= nil and
+                          current.counters.tasks_completed ~= nil
+        if not available and (not checkpoint or checkpoint.done) then
             status = 'unavailable'
             break
         end
@@ -654,13 +741,14 @@ function M.postrun(space, stats, before)
         current = M.sample(space, stats)
         update_rss(rss, current.time, current.gauges.rss_bytes)
         update_rss(interval_rss, current.time, current.gauges.rss_bytes)
-        if current.gauges.tasks_inprogress ~= 0 or
+        if checkpoint and checkpoint.error then status = 'checkpoint_failed'; break end
+        if (checkpoint and not checkpoint.done) or current.gauges.tasks_inprogress ~= 0 or
            current.counters.tasks_completed ~= previous.counters.tasks_completed or
            current.counters.dump_out ~= previous.counters.dump_out or
            current.counters.compaction_out ~= previous.counters.compaction_out then
             quiet_since = current.time
         end
-        if current.time - quiet_since >= POSTRUN_QUIET then
+        if (not checkpoint or checkpoint.done) and current.time - quiet_since >= POSTRUN_QUIET then
             status = 'idle_observed'
             break
         end
@@ -671,10 +759,19 @@ function M.postrun(space, stats, before)
             interval_rss = new_rss(current.time, current.gauges.rss_bytes)
         end
     end
+    current = M.sample(space, stats)
+    update_rss(rss, current.time, current.gauges.rss_bytes)
+    update_rss(interval_rss, current.time, current.gauges.rss_bytes)
+    if checkpoint and checkpoint.error then
+        status = 'checkpoint_failed'
+    elseif checkpoint and (not checkpoint.done or checkpoint.finished_at > checkpoint.wait_deadline) then
+        status = 'checkpoint_timeout'
+    end
     report_interval('postrun', reported, current, interval_rss)
     M.event('postrun', status)
     local result = phase_result('postrun', before, current, rss)
     result.status = status
+    result.forced_checkpoint_pending = checkpoint ~= nil and not checkpoint.done
     return result
 end
 
@@ -694,9 +791,9 @@ function M.summary(result, postrun)
     log.info('Vinyl end:       %s %s', fields_text(last, index_gauges), fields_text(last, vinyl_gauges))
     log.info('Dump I/O:        in=%s out=%s', display(d.dump_in), display(d.dump_out))
     log.info('Compaction I/O:  in=%s out=%s', display(d.compaction_in), display(d.compaction_out))
-    log.info('Total written:   %s', display(result.vinyl_written_bytes))
+    log.info('Vinyl output (uncompressed): %s', display(result.vinyl_written_bytes))
     log.info('Logical written: %s', display(d.logical_write_bytes))
-    log.info('WA:              %s', display(result.wa))
+    log.info('WA (uncompressed, measurement): %s', display(result.wa))
     log.info('legacy_wa:       %s', display(result.legacy_wa))
     log.info('Read amplification: %s', display(result.read_amplification))
     log.info('Space amplification (estimate): %s', display(result.space_amplification_estimate))
@@ -725,28 +822,52 @@ function M.run(space, workers, config)
         local after
         result, after = M.run_phase(space, stats, workers, 'measurement', seconds)
         postrun = M.postrun(space, stats, after)
+        assert(not output.checkpoint or not output.checkpoint.error,
+               output.checkpoint and output.checkpoint.error)
+        assert(postrun.status ~= 'checkpoint_timeout', 'forced checkpoint did not finish within postrun timeout')
+        if config.checkpoint_mode == 'forced' then
+            assert(result.counters.forced_checkpoints_started > 0,
+                   'no forced checkpoint started before the measurement deadline')
+        end
         -- shortcut: tuple overhead remains estimated; replace when live serialized size is available cheaply.
         result.space_amplification_estimate = M.ratio(after.gauges.disk_bytes,
             space:count() * (config.value_size + 10)) or json.NULL
         M.summary(result, postrun)
     end)
+    local checkpoint = stop_checkpoints()
+    if checkpoint and not checkpoint.done then
+        local wait_deadline = checkpoint.wait_deadline or clock.monotonic() + POSTRUN_TIMEOUT
+        checkpoint.finished:get(math.max(0, wait_deadline - clock.monotonic()))
+        if not checkpoint.done then
+            ok, err = false, tostring(err or '') .. ' forced checkpoint did not finish before timeout'
+            M.event(checkpoint.phase, 'checkpoint_timeout', {error = err})
+        end
+    end
+    if checkpoint and checkpoint.error then ok, err = false, checkpoint.error end
     local closed, close_err = output.csv:close()
-    assert(ok, err)
-    assert(closed, close_err)
+    if not closed then
+        ok, err = false, tostring(err or '') .. ' CSV close failed: ' .. tostring(close_err)
+    end
+    if not ok then M.event('run', 'failed', {error = tostring(err)}) end
     local document = {
-        schema_version = 1, status = 'complete', config = config,
+        schema_version = 1, status = ok and 'complete' or 'incomplete', config = config,
+        error = not ok and tostring(err) or json.NULL,
+        forced_checkpoint_pending = checkpoint ~= nil and not checkpoint.done,
         tarantool = {version = box.info.version, git_sha = config.tarantool_git_sha or json.NULL},
         latency_histogram = {unit = 'us', minimum_upper_bound = 1, bucket_factor = HIST_FACTOR,
                              finite_buckets = HIST_BINS + 1, maximum_upper_bound = HIST_FACTOR ^ HIST_BINS},
         rss = {source = '/proc/self/status:VmRSS', interval_seconds = RSS_INTERVAL,
                postrun_interval_seconds = 0.1,
                mean_method = 'trapezoidal', peak_method = 'maximum_observed'},
-        logical_write_bytes_rule = 'MessagePack tuple for REPLACE; MessagePack key array for every successful DELETE; committed transactions only',
-        events = output.events, warmup = warmup_result or json.NULL, measurement = result, postrun = postrun,
+        vinyl_bytes_basis = 'uncompressed', wa_scope = 'reported_interval_or_phase',
+        logical_write_bytes_rule = 'MessagePack tuple for INSERT/REPLACE; MessagePack key array for every successful DELETE; committed transactions only',
+        events = output.events, warmup = warmup_result or json.NULL,
+        measurement = result or json.NULL, postrun = postrun or json.NULL,
     }
     local temporary = output.summary_path .. '.tmp'
     write_file(temporary, json.encode(document) .. '\n')
     assert(fio.rename(temporary, output.summary_path))
+    assert(ok, err)
 end
 
 return M

@@ -18,7 +18,7 @@
 -- Usage:
 --   tarantool vinyl_workload_b.lua [minutes] [scale]
 --
--- Existing data is reused; next_key is derived from the row count, not max key.
+-- Existing data is reused; appends start after the largest existing key.
 -- WARMUP_SECONDS defaults to 0; measurement duration defaults depend on scale.
 --
 
@@ -33,12 +33,13 @@ local BATCH_SIZE = config.batch_size
 local LOAD_BATCH = 5000
 local NUM_WRITERS = config.writers
 local NUM_READERS = config.readers
+local MAX_KEY = 9007199254740991
 
 box.cfg{
     log       = 'picodata.log',
     log_level = 'info',
     checkpoint_count    = 2,
-    checkpoint_interval = config.checkpoint_interval,
+    checkpoint_interval = config.native_checkpoint_interval,
     vinyl_cache         = config.vinyl_cache,
     vinyl_memory        = config.vinyl_memory,
 }
@@ -77,16 +78,21 @@ local random_key = benchmark.key_generator(config)
 
 local function load_data()
     local count = space:count()
-    if count >= INITIAL_KEYS then
+    local last = space.index.pk:max()
+    assert(last == nil or last[1] <= MAX_KEY, 'existing keys must be <= 2^53-1')
+    local max_key = last and tonumber(last[1]) or 0
+    local missing = math.max(0, INITIAL_KEYS - count)
+    assert(missing <= MAX_KEY - max_key, 'initial load would exhaust the exact integer key range')
+    if missing == 0 then
         log.info('bench_b: data already loaded (%d rows)', count)
-        return count
+        return max_key
     end
-    log.info('bench_b: loading data from key %d to %d ...', count + 1, INITIAL_KEYS)
+    log.info('bench_b: loading %d rows from key %d to %d ...', missing, max_key + 1, max_key + missing)
     local batch = 0
     local t0 = clock.monotonic()
     box.begin()
-    for i = count + 1, INITIAL_KEYS do
-        space:replace({ i, random_value() })
+    for i = 1, missing do
+        space:insert({ max_key + i, random_value() })
         batch = batch + 1
         if batch >= LOAD_BATCH then
             box.commit()
@@ -95,9 +101,9 @@ local function load_data()
             if i % math.max(100000, math.floor(INITIAL_KEYS / 20)) == 0 then
                 local elapsed = clock.monotonic() - t0
                 local rate = i / elapsed
-                local eta = (INITIAL_KEYS - i) / rate
+                local eta = (missing - i) / rate
                 log.info('bench_b: loaded %dM / %dM (%.0f rows/s, ETA %.0fs)',
-                         i / 1e6, INITIAL_KEYS / 1e6, rate, eta)
+                         (count + i) / 1e6, INITIAL_KEYS / 1e6, rate, eta)
             end
         end
     end
@@ -109,27 +115,29 @@ local function load_data()
     local elapsed = clock.monotonic() - t0
     log.info('bench_b: load complete, %d rows in %.1fs', space:count(), elapsed)
     benchmark.snapshot()
-    return INITIAL_KEYS
+    return max_key + missing
 end
 
-local loaded = load_data()
+local last_key = load_data()
 benchmark.event('setup', 'end')
 
 -------------------------------------------------------------------------------
 -- Shared state
 -------------------------------------------------------------------------------
 
-local next_key = loaded + 1
+local next_key = last_key + 1
+local append = config.write_mode == 'insert' and space.insert or space.replace
 
 local function writer(stats)
     local base = next_key
+    assert(BATCH_SIZE <= MAX_KEY - base + 1, 'append would exhaust the exact integer key range')
     next_key = next_key + BATCH_SIZE
     benchmark.transaction(stats, 'tx_append', function()
         local bytes = 0
         for i = 0, BATCH_SIZE - 1 do
             local value = random_value()
             stats.op_attempts = stats.op_attempts + 1
-            local tuple = space:replace({base + i, value})
+            local tuple = append(space, {base + i, value})
             bytes = bytes + tuple:bsize()
         end
         return {inserts = BATCH_SIZE, logical_write_bytes = bytes}

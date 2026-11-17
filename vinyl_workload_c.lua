@@ -38,7 +38,7 @@ box.cfg{
     log       = 'picodata.log',
     log_level = 'info',
     checkpoint_count    = 2,
-    checkpoint_interval = config.checkpoint_interval,
+    checkpoint_interval = config.native_checkpoint_interval,
     vinyl_cache         = config.vinyl_cache,
     vinyl_memory        = config.vinyl_memory,
 }
