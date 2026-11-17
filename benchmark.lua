@@ -1,11 +1,19 @@
 local clock = require('clock')
 local fiber = require('fiber')
 local log = require('log')
+local fio = require('fio')
+local json = require('json')
+local msgpack = require('msgpack')
 
 local M = {}
 local REPORT_INTERVAL = 10
 local POSTRUN_TIMEOUT = 60
 local POSTRUN_QUIET = 1
+local RSS_INTERVAL = 1
+local LATENCY_KINDS = {'tx_mixed', 'tx_append', 'tx_delete', 'get', 'scan'}
+local HIST_FACTOR, HIST_BINS = 1.02, 2048
+local HIST_LOG = math.log(HIST_FACTOR)
+local output
 
 function M.number(value, name, minimum)
     local n = tonumber(value)
@@ -57,7 +65,23 @@ function M.config(workload, args)
         hotset_size = option('HOTSET_SIZE', 1, 0),
         checkpoint_mode = os.getenv('CHECKPOINT_MODE') or 'auto',
         checkpoint_interval = option('CHECKPOINT_INTERVAL', 600, 0),
+        seed = option('SEED', tonumber(clock.realtime64() % 2147483647), 0),
+        run_id = os.getenv('RUN_ID') or workload .. '-' .. string.format('%.0f', clock.realtime() * 1e6),
+        output_dir = os.getenv('OUTPUT_DIR') or '.',
+        tarantool_git_sha = os.getenv('TARANTOOL_GIT_SHA'),
+        si_window = os.getenv('SI_WINDOW'),
     }
+    assert(config.run_id:match('^[%w_.-]+$') and config.run_id ~= '.' and config.run_id ~= '..',
+           'RUN_ID must contain only letters, digits, underscores, dots or hyphens')
+    assert(config.output_dir ~= '' and not config.output_dir:find('%z'), 'OUTPUT_DIR must be a nonempty path')
+    config.output_dir = fio.abspath(config.output_dir)
+    assert(config.seed <= 2147483647, 'SEED must be <= 2147483647')
+    if config.tarantool_git_sha ~= nil then
+        assert(#config.tarantool_git_sha == 40 and config.tarantool_git_sha:match('^%x+$'),
+               'TARANTOOL_GIT_SHA must be a full 40-digit hexadecimal commit ID')
+    end
+    assert(config.si_window == nil or config.si_window == 'auto' or config.si_window == 'zero',
+           'SI_WINDOW must be auto or zero')
     assert(config.key_distribution == 'uniform' or config.key_distribution == 'zipfian' or
            (workload == 'b' and config.key_distribution == 'latest'),
            'KEY_DISTRIBUTION must be uniform or zipfian (also latest for B)')
@@ -74,7 +98,7 @@ function M.config(workload, args)
         config.workers = option('WORKERS', 8, 1)
     end
     for _, name in ipairs({'num_keys', 'value_size', 'vinyl_memory', 'vinyl_cache',
-                          'batch_size', 'workers', 'writers', 'readers', 'checkpoint_interval'}) do
+                          'batch_size', 'workers', 'writers', 'readers', 'checkpoint_interval', 'seed'}) do
         local value = config[name]
         if value ~= nil then
             assert(value == math.floor(value) and value <= 9007199254740991,
@@ -187,8 +211,13 @@ function M.value_generator(size)
 end
 
 function M.event(phase, event)
+    local monotonic, realtime = clock.monotonic(), clock.realtime()
     log.info('phase=%s event=%s monotonic=%.6f realtime=%.6f',
-             phase, event, clock.monotonic(), clock.realtime())
+             phase, event, monotonic, realtime)
+    if output then
+        output.events[#output.events + 1] = {phase = phase, event = event,
+                                           monotonic = monotonic, realtime = realtime}
+    end
 end
 
 function M.snapshot()
@@ -204,7 +233,76 @@ function M.new_stats()
         scan_rows = 0, read_miss = 0, op_attempts = 0,
         tx_attempts = 0, tx_committed = 0, tx_failed = 0,
         rollback_calls = 0, rollback_errors = 0, errors = 0,
+        logical_write_bytes = 0,
     }
+end
+
+function M.delete_bytes(key)
+    return #msgpack.encode({key})
+end
+
+function M.observe_latency(stats, kind, started)
+    local us = math.max(0, (clock.monotonic() - started) * 1e6)
+    local bucket = us <= 1 and 0 or math.ceil(math.log(us) / HIST_LOG)
+    bucket = math.min(HIST_BINS + 1, bucket)
+    local histogram = stats.latency[kind]
+    histogram[bucket] = (histogram[bucket] or 0) + 1
+end
+
+local function latency_delta(before, after)
+    local result = {}
+    for _, kind in ipairs(LATENCY_KINDS) do
+        local bins, count = {}, 0
+        for bucket, value in pairs(after[kind]) do
+            bins[bucket] = value - (before[kind][bucket] or 0)
+            count = count + bins[bucket]
+        end
+        local values = {count = count, overflow = bins[HIST_BINS + 1] or 0}
+        for _, p in ipairs({50, 95, 99}) do
+            local seen, rank = 0, math.ceil(count * p / 100)
+            values['p' .. p .. '_us'] = json.NULL
+            if count > 0 then
+                for bucket = 0, HIST_BINS do
+                    seen = seen + (bins[bucket] or 0)
+                    if seen >= rank then
+                        values['p' .. p .. '_us'] = HIST_FACTOR ^ bucket
+                        break
+                    end
+                end
+            end
+        end
+        result[kind] = values
+    end
+    return result
+end
+
+local function read_rss()
+    local file = io.open('/proc/self/status', 'r')
+    if not file then return nil end
+    local text = file:read('*a')
+    file:close()
+    local kb = text and tonumber(text:match('\nVmRSS:%s+(%d+)%s+kB'))
+    return kb and kb * 1024 or nil
+end
+
+local function new_rss(time, value)
+    return {time = time, value = value, area = 0, seconds = 0, peak = value,
+            samples = value and 1 or 0, missing = value and 0 or 1}
+end
+
+local function update_rss(rss, time, value)
+    local dt = time - rss.time
+    if rss.value and value then rss.area = rss.area + (rss.value + value) * 0.5 * dt end
+    rss.seconds = rss.seconds + dt
+    rss.samples = rss.samples + (value and 1 or 0)
+    rss.missing = rss.missing + (value and 0 or 1)
+    if value then rss.peak = math.max(rss.peak or value, value) end
+    rss.time, rss.value = time, value
+end
+
+local function rss_summary(rss)
+    return {mean_bytes = rss.missing == 0 and rss.seconds > 0 and rss.area / rss.seconds or json.NULL,
+            peak_sampled_bytes = rss.peak or json.NULL, samples = rss.samples, missing = rss.missing}
 end
 
 local function record_error(stats, err)
@@ -212,8 +310,9 @@ local function record_error(stats, err)
     if stats.errors <= 3 then log.warn('workload error: %s', tostring(err)) end
 end
 
-function M.transaction(stats, body)
+function M.transaction(stats, kind, body)
     stats.tx_attempts = stats.tx_attempts + 1
+    local started = clock.monotonic()
     local ok, completed = pcall(function()
         box.begin()
         local result = body()
@@ -232,6 +331,7 @@ function M.transaction(stats, body)
         end
         return false
     end
+    M.observe_latency(stats, kind, started)
     stats.tx_committed = stats.tx_committed + 1
     for key, value in pairs(completed) do stats[key] = stats[key] + value end
     return true
@@ -282,14 +382,21 @@ local function collect(target, source, fields)
 end
 
 function M.sample(space, stats)
-    local sample = {counters = {}, gauges = {}}
+    local sample = {counters = {}, gauges = {}, latency = {}}
     local vs, idx = box.stat.vinyl(), space.index.pk:stat()
-    for key, value in pairs(stats) do sample.counters[key] = value end
+    for key, value in pairs(stats) do
+        if type(value) == 'number' then sample.counters[key] = value end
+    end
+    for kind, histogram in pairs(stats.latency) do
+        sample.latency[kind] = {}
+        for bucket, count in pairs(histogram) do sample.latency[kind][bucket] = count end
+    end
     sample.counters.ops = stats.reads + stats.writes + stats.inserts + stats.deletes + stats.scans
     collect(sample.counters, idx, index_counters)
     collect(sample.counters, vs, vinyl_counters)
     collect(sample.gauges, idx, index_gauges)
     collect(sample.gauges, vs, vinyl_gauges)
+    sample.gauges.rss_bytes = read_rss()
     sample.time = clock.monotonic()
     return sample
 end
@@ -330,7 +437,86 @@ function M.log_config(config)
     log.info('Configuration: %s', fields_text(config, config))
 end
 
-local function report_interval(phase, before, after)
+local function sorted_keys(values)
+    local keys = {}
+    for key in pairs(values) do keys[#keys + 1] = key end
+    table.sort(keys)
+    return keys
+end
+
+local counter_fields, gauge_fields = M.new_stats(), {rss_bytes = true}
+counter_fields.ops = true
+for name in pairs(index_counters) do counter_fields[name] = true end
+for name in pairs(vinyl_counters) do counter_fields[name] = true end
+for name in pairs(index_gauges) do gauge_fields[name] = true end
+for name in pairs(vinyl_gauges) do gauge_fields[name] = true end
+
+local function nullable_fields(values, fields)
+    local result = {}
+    for name in pairs(fields) do result[name] = values[name] or json.NULL end
+    return result
+end
+
+local columns = {'run_id', 'phase', 'start_monotonic', 'end_monotonic', 'seconds',
+                 'OPS', 'TPS_explicit', 'vinyl_written_bytes', 'wa', 'legacy_wa',
+                 'read_amplification', 'rss_mean_bytes', 'rss_peak_sampled_bytes',
+                 'rss_samples', 'rss_missing'}
+for _, name in ipairs(sorted_keys(counter_fields)) do columns[#columns + 1] = name end
+for _, name in ipairs(sorted_keys(gauge_fields)) do columns[#columns + 1] = name end
+for _, kind in ipairs(LATENCY_KINDS) do
+    for _, field in ipairs({'count', 'p50_us', 'p95_us', 'p99_us', 'overflow'}) do
+        columns[#columns + 1] = kind .. '_' .. field
+    end
+end
+
+local function csv_cell(value)
+    if value == nil then return '' end
+    if type(value) == 'number' then return string.format('%.17g', value) end
+    return '"' .. tostring(value):gsub('"', '""') .. '"'
+end
+
+local function write_file(path, text)
+    local file = assert(fio.open(path, {'O_WRONLY', 'O_CREAT', 'O_EXCL'}, tonumber('644', 8)))
+    local ok, err = file:write(text)
+    local closed, close_err = file:close()
+    assert(ok, err)
+    assert(closed, close_err)
+end
+
+function M.prepare(config)
+    assert(output == nil, 'only one benchmark run per process is supported')
+    assert(fio.mktree(config.output_dir))
+    local summary_path = fio.pathjoin(config.output_dir, 'summary.json')
+    local csv_path = fio.pathjoin(config.output_dir, 'timeseries.csv')
+    assert(not fio.lstat(summary_path) and not fio.lstat(csv_path) and not fio.lstat(summary_path .. '.tmp'),
+           'result files already exist in OUTPUT_DIR')
+    write_file(summary_path, json.encode({schema_version = 1, status = 'incomplete', config = config}) .. '\n')
+    local csv = assert(fio.open(csv_path, {'O_WRONLY', 'O_CREAT', 'O_EXCL'}, tonumber('644', 8)))
+    local written, err = csv:write(table.concat(columns, ',') .. '\n')
+    if not written then csv:close(); error(err) end
+    output = {csv = csv, summary_path = summary_path, config = config, events = {}}
+    math.randomseed(config.seed)
+end
+
+local function phase_result(phase, before, after, rss, requested)
+    local d = M.delta(before.counters, after.counters)
+    local dt = after.time - before.time
+    local written = add(d.dump_out, d.compaction_out)
+    return {phase = phase, start_monotonic = before.time, end_monotonic = after.time,
+            seconds = dt, requested_seconds = requested or json.NULL,
+            counters = nullable_fields(d, counter_fields),
+            gauges_start = nullable_fields(before.gauges, gauge_fields),
+            gauges_end = nullable_fields(after.gauges, gauge_fields),
+            OPS = M.ratio(d.ops, dt) or json.NULL,
+            TPS_explicit = M.ratio(d.tx_committed, dt) or json.NULL,
+            vinyl_written_bytes = written or json.NULL,
+            wa = M.ratio(written, d.logical_write_bytes) or json.NULL,
+            legacy_wa = M.ratio(written, d.dump_in) or json.NULL,
+            read_amplification = M.ratio(d.disk_read_bytes, d.get_bytes) or json.NULL,
+            latency = latency_delta(before.latency, after.latency), rss = rss_summary(rss)}
+end
+
+local function report_interval(phase, before, after, rss)
     local dt = after.time - before.time
     if dt <= 0 then return end
     local d = M.delta(before.counters, after.counters)
@@ -342,6 +528,27 @@ local function report_interval(phase, before, after)
              fields_text(d, index_counters), fields_text(d, vinyl_counters))
     log.info('phase=%s vinyl_current %s %s', phase,
              fields_text(after.gauges, index_gauges), fields_text(after.gauges, vinyl_gauges))
+    local data = phase_result(phase, before, after, rss)
+    log.info('phase=%s wa=%s legacy_wa=%s rss_mean_bytes=%s rss_peak_sampled_bytes=%s',
+             phase, display(data.wa), display(data.legacy_wa),
+             display(data.rss.mean_bytes), display(data.rss.peak_sampled_bytes))
+    for _, kind in ipairs(LATENCY_KINDS) do
+        log.info('phase=%s latency=%s %s', phase, kind, fields_text(data.latency[kind], data.latency[kind]))
+    end
+    local row = {run_id = output.config.run_id, phase = phase,
+                 start_monotonic = before.time, end_monotonic = after.time, seconds = dt,
+                 OPS = data.OPS, TPS_explicit = data.TPS_explicit,
+                 vinyl_written_bytes = data.vinyl_written_bytes, wa = data.wa,
+                 legacy_wa = data.legacy_wa, read_amplification = data.read_amplification}
+    for name, value in pairs(d) do row[name] = value end
+    for name, value in pairs(after.gauges) do row[name] = value end
+    for name, value in pairs(data.rss) do row['rss_' .. name] = value end
+    for kind, values in pairs(data.latency) do
+        for name, value in pairs(values) do row[kind .. '_' .. name] = value end
+    end
+    local cells = {}
+    for i, name in ipairs(columns) do cells[i] = csv_cell(row[name]) end
+    assert(output.csv:write(table.concat(cells, ',') .. '\n'))
 end
 
 function M.run_phase(space, stats, workers, phase, seconds)
@@ -369,6 +576,8 @@ function M.run_phase(space, stats, workers, phase, seconds)
     M.event(phase, 'start')
     local before = M.sample(space, stats)
     local previous = before
+    local rss = new_rss(before.time, before.gauges.rss_bytes)
+    local interval_rss = new_rss(before.time, before.gauges.rss_bytes)
     deadline = before.time + seconds
     log.info('phase=%s clock_start=%.6f deadline=%.6f', phase, before.time, deadline)
     for _ = 1, #workers do gate:put(true) end
@@ -377,6 +586,7 @@ function M.run_phase(space, stats, workers, phase, seconds)
     local ok, err = pcall(function()
         local remaining = #workers
         local next_report = before.time + REPORT_INTERVAL
+        local next_rss = before.time + RSS_INTERVAL
         local stopping = false
         while remaining > 0 do
             local now = clock.monotonic()
@@ -384,7 +594,8 @@ function M.run_phase(space, stats, workers, phase, seconds)
                 stop, stopping = true, true
                 M.event(phase, 'stop_requested')
             end
-            local wake_at = stopping and next_report or math.min(deadline, next_report)
+            local wake_at = math.min(next_report, next_rss)
+            if not stopping then wake_at = math.min(deadline, wake_at) end
             local result = done:get(math.max(0, wake_at - now))
             if result then
                 remaining = remaining - 1
@@ -392,9 +603,19 @@ function M.run_phase(space, stats, workers, phase, seconds)
             end
             if remaining > 0 and clock.monotonic() >= next_report then
                 local current = M.sample(space, stats)
-                report_interval(phase, previous, current)
+                update_rss(rss, current.time, current.gauges.rss_bytes)
+                update_rss(interval_rss, current.time, current.gauges.rss_bytes)
+                report_interval(phase, previous, current, interval_rss)
                 previous = current
+                interval_rss = new_rss(current.time, current.gauges.rss_bytes)
                 next_report = current.time + REPORT_INTERVAL
+                next_rss = current.time + RSS_INTERVAL
+            elseif remaining > 0 and clock.monotonic() >= next_rss then
+                local value = read_rss()
+                local sampled_at = clock.monotonic()
+                update_rss(rss, sampled_at, value)
+                update_rss(interval_rss, sampled_at, value)
+                next_rss = sampled_at + RSS_INTERVAL
             end
         end
     end)
@@ -408,16 +629,19 @@ function M.run_phase(space, stats, workers, phase, seconds)
         error(failure or err)
     end
     local after = M.sample(space, stats)
-    report_interval(phase, previous, after)
+    update_rss(rss, after.time, after.gauges.rss_bytes)
+    update_rss(interval_rss, after.time, after.gauges.rss_bytes)
+    report_interval(phase, previous, after, interval_rss)
     M.event(phase, 'end')
-    return {before = before, after = after, requested = seconds,
-            elapsed = after.time - before.time,
-            counters = M.delta(before.counters, after.counters)}
+    return phase_result(phase, before, after, rss, seconds), after
 end
 
 function M.postrun(space, stats, before)
     M.event('postrun', 'start')
     local previous, current = before, before
+    local reported = before
+    local rss = new_rss(before.time, before.gauges.rss_bytes)
+    local interval_rss = new_rss(before.time, before.gauges.rss_bytes)
     local quiet_since = before.time
     local status = 'timeout'
     while current.time - before.time < POSTRUN_TIMEOUT do
@@ -428,6 +652,8 @@ function M.postrun(space, stats, before)
         end
         fiber.sleep(0.1)
         current = M.sample(space, stats)
+        update_rss(rss, current.time, current.gauges.rss_bytes)
+        update_rss(interval_rss, current.time, current.gauges.rss_bytes)
         if current.gauges.tasks_inprogress ~= 0 or
            current.counters.tasks_completed ~= previous.counters.tasks_completed or
            current.counters.dump_out ~= previous.counters.dump_out or
@@ -439,22 +665,28 @@ function M.postrun(space, stats, before)
             break
         end
         previous = current
+        if current.time - reported.time >= REPORT_INTERVAL then
+            report_interval('postrun', reported, current, interval_rss)
+            reported = current
+            interval_rss = new_rss(current.time, current.gauges.rss_bytes)
+        end
     end
-    report_interval('postrun', before, current)
+    report_interval('postrun', reported, current, interval_rss)
     M.event('postrun', status)
-    return status
+    local result = phase_result('postrun', before, current, rss)
+    result.status = status
+    return result
 end
 
-function M.summary(space, result, postrun_status, value_size)
-    local d, first, last = result.counters, result.before.gauges, result.after.gauges
-    local written = add(d.dump_out, d.compaction_out)
+function M.summary(result, postrun)
+    local d, first, last = result.counters, result.gauges_start, result.gauges_end
     log.info('=== FINAL REPORT ===')
     log.info('Phase:           measurement')
     log.info('Duration:        requested=%.6f actual=%.6f overrun=%.6f',
-             result.requested, result.elapsed, math.max(0, result.elapsed - result.requested))
+             result.requested_seconds, result.seconds, math.max(0, result.seconds - result.requested_seconds))
     log.info('Total ops:       %d', d.ops)
-    log.info('OPS:             %s', display(M.ratio(d.ops, result.elapsed)))
-    log.info('TPS (explicit):  %s', display(M.ratio(d.tx_committed, result.elapsed)))
+    log.info('OPS:             %s', display(result.OPS))
+    log.info('TPS (explicit):  %s', display(result.TPS_explicit))
     log.info('Counters:        %s', fields_text(d, M.new_stats()))
     log.info('Errors:          %d', d.errors)
     log.info('Vinyl delta:     %s %s', fields_text(d, index_counters), fields_text(d, vinyl_counters))
@@ -462,13 +694,17 @@ function M.summary(space, result, postrun_status, value_size)
     log.info('Vinyl end:       %s %s', fields_text(last, index_gauges), fields_text(last, vinyl_gauges))
     log.info('Dump I/O:        in=%s out=%s', display(d.dump_in), display(d.dump_out))
     log.info('Compaction I/O:  in=%s out=%s', display(d.compaction_in), display(d.compaction_out))
-    log.info('Total written:   %s', display(written))
-    log.info('legacy_wa:       %s', display(M.ratio(written, d.dump_in)))
-    log.info('Read amplification: %s', display(M.ratio(d.disk_read_bytes, d.get_bytes)))
-    -- shortcut: 10 bytes of key/tuple overhead is an estimate; replace when serialized sizes are measured.
-    log.info('Space amplification (estimate): %s',
-             display(M.ratio(last.disk_bytes, space:count() * (value_size + 10))))
-    log.info('Postrun:         %s (excluded from measurement)', postrun_status)
+    log.info('Total written:   %s', display(result.vinyl_written_bytes))
+    log.info('Logical written: %s', display(d.logical_write_bytes))
+    log.info('WA:              %s', display(result.wa))
+    log.info('legacy_wa:       %s', display(result.legacy_wa))
+    log.info('Read amplification: %s', display(result.read_amplification))
+    log.info('Space amplification (estimate): %s', display(result.space_amplification_estimate))
+    log.info('RSS:             %s', fields_text(result.rss, result.rss))
+    for _, kind in ipairs(LATENCY_KINDS) do
+        log.info('Latency %s: %s', kind, fields_text(result.latency[kind], result.latency[kind]))
+    end
+    log.info('Postrun:         %s (excluded from measurement)', postrun.status)
     log.info('=== END REPORT ===')
 end
 
@@ -477,14 +713,40 @@ function M.run(space, workers, config)
     log.info('workload=%s workers=%d warmup_seconds=%.6f measurement_seconds=%.6f',
              space.name, #workers, warmup, seconds)
     local stats = M.new_stats()
-    if warmup > 0 then
-        M.run_phase(space, stats, workers, 'warmup', warmup)
-    else
-        M.event('warmup', 'skipped')
-    end
-    local result = M.run_phase(space, stats, workers, 'measurement', seconds)
-    local postrun_status = M.postrun(space, stats, result.after)
-    M.summary(space, result, postrun_status, config.value_size)
+    stats.latency = {}
+    for _, kind in ipairs(LATENCY_KINDS) do stats.latency[kind] = {} end
+    local warmup_result, result, postrun
+    local ok, err = pcall(function()
+        if warmup > 0 then
+            warmup_result = M.run_phase(space, stats, workers, 'warmup', warmup)
+        else
+            M.event('warmup', 'skipped')
+        end
+        local after
+        result, after = M.run_phase(space, stats, workers, 'measurement', seconds)
+        postrun = M.postrun(space, stats, after)
+        -- shortcut: tuple overhead remains estimated; replace when live serialized size is available cheaply.
+        result.space_amplification_estimate = M.ratio(after.gauges.disk_bytes,
+            space:count() * (config.value_size + 10)) or json.NULL
+        M.summary(result, postrun)
+    end)
+    local closed, close_err = output.csv:close()
+    assert(ok, err)
+    assert(closed, close_err)
+    local document = {
+        schema_version = 1, status = 'complete', config = config,
+        tarantool = {version = box.info.version, git_sha = config.tarantool_git_sha or json.NULL},
+        latency_histogram = {unit = 'us', minimum_upper_bound = 1, bucket_factor = HIST_FACTOR,
+                             finite_buckets = HIST_BINS + 1, maximum_upper_bound = HIST_FACTOR ^ HIST_BINS},
+        rss = {source = '/proc/self/status:VmRSS', interval_seconds = RSS_INTERVAL,
+               postrun_interval_seconds = 0.1,
+               mean_method = 'trapezoidal', peak_method = 'maximum_observed'},
+        logical_write_bytes_rule = 'MessagePack tuple for REPLACE; MessagePack key array for every successful DELETE; committed transactions only',
+        events = output.events, warmup = warmup_result or json.NULL, measurement = result, postrun = postrun,
+    }
+    local temporary = output.summary_path .. '.tmp'
+    write_file(temporary, json.encode(document) .. '\n')
+    assert(fio.rename(temporary, output.summary_path))
 end
 
 return M

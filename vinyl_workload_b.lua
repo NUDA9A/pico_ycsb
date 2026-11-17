@@ -27,6 +27,7 @@ local clock = require('clock')
 local fio = require('fio')
 local benchmark = dofile(fio.pathjoin(fio.dirname(arg[0]), 'benchmark.lua'))
 local config = benchmark.config('b', arg)
+benchmark.prepare(config)
 local INITIAL_KEYS = config.num_keys
 local BATCH_SIZE = config.batch_size
 local LOAD_BATCH = 5000
@@ -123,13 +124,15 @@ local next_key = loaded + 1
 local function writer(stats)
     local base = next_key
     next_key = next_key + BATCH_SIZE
-    benchmark.transaction(stats, function()
+    benchmark.transaction(stats, 'tx_append', function()
+        local bytes = 0
         for i = 0, BATCH_SIZE - 1 do
             local value = random_value()
             stats.op_attempts = stats.op_attempts + 1
-            space:replace({base + i, value})
+            local tuple = space:replace({base + i, value})
+            bytes = bytes + tuple:bsize()
         end
-        return {inserts = BATCH_SIZE}
+        return {inserts = BATCH_SIZE, logical_write_bytes = bytes}
     end)
 end
 
@@ -140,14 +143,16 @@ local function reader(stats)
             if max_key < 1 then return end
             local key = random_key(max_key)
             stats.op_attempts = stats.op_attempts + 1
+            local started = clock.monotonic()
             local tuple = space:get(key)
+            benchmark.observe_latency(stats, 'get', started)
             stats.reads = stats.reads + 1
             if tuple == nil then stats.read_miss = stats.read_miss + 1 end
         end
     end)
 end
 
-math.randomseed(tonumber(clock.realtime64() % 2147483647))
+math.randomseed(config.seed)
 local workers = {}
 if config.mix_mode == 'dedicated' then
     for _ = 1, NUM_WRITERS do workers[#workers + 1] = writer end

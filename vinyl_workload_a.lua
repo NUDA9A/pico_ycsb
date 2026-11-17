@@ -21,6 +21,7 @@ local clock = require('clock')
 local fio = require('fio')
 local benchmark = dofile(fio.pathjoin(fio.dirname(arg[0]), 'benchmark.lua'))
 local config = benchmark.config('a', arg)
+benchmark.prepare(config)
 local NUM_KEYS = config.num_keys
 local BATCH_SIZE = config.batch_size
 local LOAD_BATCH = 5000
@@ -115,8 +116,8 @@ benchmark.event('setup', 'end')
 -------------------------------------------------------------------------------
 
 local function worker(stats)
-    benchmark.transaction(stats, function()
-        local completed = {reads = 0, writes = 0, read_miss = 0}
+    benchmark.transaction(stats, 'tx_mixed', function()
+        local completed = {reads = 0, writes = 0, read_miss = 0, logical_write_bytes = 0}
         for _ = 1, BATCH_SIZE do
             local key = random_key(NUM_KEYS)
             if next_operation() == 'read' then
@@ -127,7 +128,8 @@ local function worker(stats)
             else
                 local value = random_value()
                 stats.op_attempts = stats.op_attempts + 1
-                space:replace({key, value})
+                local tuple = space:replace({key, value})
+                completed.logical_write_bytes = completed.logical_write_bytes + tuple:bsize()
                 completed.writes = completed.writes + 1
             end
         end
@@ -135,7 +137,7 @@ local function worker(stats)
     end)
 end
 
-math.randomseed(tonumber(clock.realtime64() % 2147483647))
+math.randomseed(config.seed)
 local workers = {}
 for i = 1, NUM_FIBERS do workers[i] = worker end
 benchmark.run(space, workers, config)

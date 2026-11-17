@@ -27,6 +27,7 @@ local clock = require('clock')
 local fio = require('fio')
 local benchmark = dofile(fio.pathjoin(fio.dirname(arg[0]), 'benchmark.lua'))
 local config = benchmark.config('c', arg)
+benchmark.prepare(config)
 local NUM_KEYS = config.num_keys
 local BATCH_SIZE = config.batch_size
 local LOAD_BATCH = 5000
@@ -122,24 +123,28 @@ local next_new_key = NUM_KEYS + 1
 local function worker(stats)
     local op = next_operation()
     if op == 'delete' then
-        benchmark.transaction(stats, function()
+        benchmark.transaction(stats, 'tx_delete', function()
+            local bytes = 0
             for _ = 1, BATCH_SIZE do
                 local key = random_key(next_new_key - 1)
                 stats.op_attempts = stats.op_attempts + 1
                 space:delete(key)
+                bytes = bytes + benchmark.delete_bytes(key)
             end
-            return {deletes = BATCH_SIZE}
+            return {deletes = BATCH_SIZE, logical_write_bytes = bytes}
         end)
     elseif op == 'insert' then
         local base = next_new_key
         next_new_key = next_new_key + BATCH_SIZE
-        benchmark.transaction(stats, function()
+        benchmark.transaction(stats, 'tx_append', function()
+            local bytes = 0
             for i = 0, BATCH_SIZE - 1 do
                 local value = random_value()
                 stats.op_attempts = stats.op_attempts + 1
-                space:replace({base + i, value})
+                local tuple = space:replace({base + i, value})
+                bytes = bytes + tuple:bsize()
             end
-            return {inserts = BATCH_SIZE}
+            return {inserts = BATCH_SIZE, logical_write_bytes = bytes}
         end)
     elseif op == 'scan' then
         benchmark.operations(stats, function()
@@ -147,10 +152,12 @@ local function worker(stats)
                 local start_key = random_key(math.max(1, next_new_key - SCAN_LENGTH))
                 local count = 0
                 stats.op_attempts = stats.op_attempts + 1
+                local started = clock.monotonic()
                 for _, tuple in space:pairs(start_key, {iterator = 'GE'}) do
                     count = count + 1
                     if count >= SCAN_LENGTH then break end
                 end
+                benchmark.observe_latency(stats, 'scan', started)
                 stats.scans = stats.scans + 1
                 stats.scan_rows = stats.scan_rows + count
             end
@@ -160,7 +167,9 @@ local function worker(stats)
             for _ = 1, BATCH_SIZE do
                 local key = random_key(next_new_key - 1)
                 stats.op_attempts = stats.op_attempts + 1
+                local started = clock.monotonic()
                 local tuple = space:get(key)
+                benchmark.observe_latency(stats, 'get', started)
                 stats.reads = stats.reads + 1
                 if tuple == nil then stats.read_miss = stats.read_miss + 1 end
             end
@@ -168,7 +177,7 @@ local function worker(stats)
     end
 end
 
-math.randomseed(tonumber(clock.realtime64() % 2147483647))
+math.randomseed(config.seed)
 local workers = {}
 for i = 1, NUM_FIBERS do workers[i] = worker end
 benchmark.run(space, workers, config)

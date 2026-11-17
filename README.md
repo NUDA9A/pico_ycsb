@@ -24,16 +24,18 @@ Each C batch contains `BATCH_SIZE` operations; each scan returns up to 200 rows.
 ./run_all.sh /path/to/tarantool my_test
 ```
 
-Results go to `/var/opt/bench/my_test_{a,b,c}/picodata.log`.
-**Use a new prefix: launch scripts delete existing directories for that prefix.**
+Each `/var/opt/bench/my_test_{a,b,c}/` contains `picodata.log`, `summary.json`
+and `timeseries.csv`. Existing result directories are rejected, never deleted.
 
 ## Usage
 
 ```text
-./run_all.sh <tarantool_binary> <prefix> [scale]
+./run_all.sh <tarantool_binary> <prefix> [scale] [a|b|c|all]
 ```
 
 `scale` defaults to 10 and sets defaults for dataset size, memory and runtime.
+The workload selector defaults to `all`. `OUTPUT_DIR` overrides the parent
+directory; `RUN_ID` overrides the metadata prefix (default: `prefix`).
 
 | Scale | Keys | Approximate data size | Measurement duration |
 |-------|------|-----------------------|----------------------|
@@ -51,6 +53,13 @@ tarantool vinyl_workload_c.lua [minutes] [scale]
 
 Keep `benchmark.lua` beside the scripts and use a fresh working directory.
 Positional arguments override environment settings; `""` skips an argument.
+For direct Lua launches, `OUTPUT_DIR` selects the JSON/CSV directory (default:
+current directory); database files and `picodata.log` stay in the working directory.
+
+`./run_si_bench.sh <tarantool_binary> [scale] [run_id]` runs both SI variants
+under `OUTPUT_DIR/run_id/{auto,zero}_{a,b,c}/`. The ID defaults to `RUN_ID` or is generated;
+an existing run directory is rejected. The `zero` variant requires a build
+exporting `vinyl_set_conflict_window`.
 
 ## Configuration
 
@@ -73,6 +82,10 @@ validated before `box.cfg()`. Resolved values are logged as `Configuration:`.
 | `HOTSET_SIZE` | Eligible fraction of the key range, in `(0, 1]`: `1` |
 | `CHECKPOINT_MODE` | `auto` or `off`; default `auto` |
 | `CHECKPOINT_INTERVAL` | Native daemon interval in seconds: `600`; `off` forces `0` |
+| `SEED` | Integer in `[0, 2147483647]`; generated when omitted and saved in the results |
+| `RUN_ID` | Run label; generated for direct Lua launches |
+| `OUTPUT_DIR` | Result directory for Lua; parent directory for launch scripts |
+| `TARANTOOL_GIT_SHA` | Optional full 40-digit SHA of the Tarantool build; unknown if omitted |
 
 Sizes use bytes without suffixes. Counts and byte sizes must be integers.
 
@@ -107,7 +120,9 @@ NUM_KEYS=100000 VALUE_SIZE=90 VINYL_MEMORY=67108864 \
 ```
 
 Launch scripts inherit these variables; use individual scripts for different
-A/B/C settings.
+A/B/C settings. Each launcher shares one seed across its runs. Setup and workload
+each start from that seed; scheduling and time limits can still change the sequence
+of operations completed by concurrent workers.
 
 ## Metrics
 
@@ -116,6 +131,9 @@ Every 10 seconds and for the final partial interval, the log reports:
 - **OPS:** successfully completed operations per second.
 - **TPS (explicit):** successful explicit commits per second.
 - Attempts, failures, errors and rollback calls.
+- **Latency p50/p95/p99:** successful `tx_mixed` (A), `tx_append` (B/C),
+  `tx_delete` (C), and independent `get`/`scan` requests (B/C).
+- **RSS:** time-weighted mean and maximum observed process memory on Linux.
 - Vinyl dump/compaction I/O, bloom/cache statistics and memory gauges.
 
 Phases: **setup → warmup → measurement → postrun**. Final counters exclude
@@ -123,10 +141,31 @@ setup/warmup; rates use actual elapsed time, including batch completion.
 Postrun observes background work separately for up to 60 seconds without
 forcing a flush. A scan counts as one operation regardless of returned rows.
 
-The final report includes `legacy_wa = (Δdump_out + Δcompaction_out) / Δdump_in`,
-read amplification and estimated space amplification (`VALUE_SIZE + 10` bytes
-per row). Unavailable ratios are `N/A`. Measurement I/O includes checkpoints
-and may include delayed warmup dumps.
+**WA** is `(Δdump_out + Δcompaction_out) / logical_write_bytes`.
+Logical bytes include committed REPLACE tuples in MessagePack and the MessagePack
+key array for every committed DELETE, including missing keys. Rolled-back writes
+are excluded. `legacy_wa` uses `Δdump_in` as its denominator. No writes means WA
+is unavailable. Checkpoints and delayed warmup dumps can contribute measurement I/O.
+
+Transaction latency covers the batch body and commit; GET/SCAN latency covers one
+request. Histograms use 1 µs as the lowest upper bound and 2% bucket steps;
+percentiles are bucket upper bounds, computed separately per interval and phase.
+RSS uses approximate `/proc/self/status` values about once per second (0.1 s in
+postrun); its sampled peak can miss short spikes. Read amplification and estimated space amplification
+(`VALUE_SIZE + 10` bytes per row) are also retained.
+
+## Result files
+
+- **summary.json:** schema version, resolved configuration, Tarantool version/SHA,
+  phase events, warmup, measurement and postrun results. An interrupted or failed
+  run retains `status: incomplete`; `complete` means reporting finished, so also
+  inspect operation error counters.
+- **timeseries.csv:** intervals by phase, OPS/TPS, operation and Vinyl counter
+  deltas, end-of-interval gauges, latency in µs, and RSS in bytes.
+
+Unavailable values are `null` in JSON, empty in CSV and `N/A` in logs. Export
+files are reserved before setup; existing files are rejected and write failures
+abort the run. No per-operation samples are retained.
 
 ## Requirements and status
 
@@ -134,8 +173,7 @@ and may include delayed warmup dumps.
 - Reused directories keep existing tuples; B/C key allocation on restart
   still needs work.
 
-Planned: runtime validation, latency percentiles, logical-write-based WA, RSS,
-JSON/CSV export, reproducible seeds, true INSERT-only and forced-checkpoint scenarios.
+Planned: runtime/reproducibility validation, true INSERT-only and forced-checkpoint scenarios.
 
 ## License
 
