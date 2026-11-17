@@ -25,7 +25,6 @@ benchmark.prepare(config)
 local NUM_KEYS = config.num_keys
 local BATCH_SIZE = config.batch_size
 local LOAD_BATCH = 5000
-local NUM_FIBERS = config.workers
 
 box.cfg{
     log       = 'picodata.log',
@@ -56,19 +55,6 @@ end
 local space = box.space.bench_a
 
 -------------------------------------------------------------------------------
--- Key and operation selection
--------------------------------------------------------------------------------
-
-local random_key = benchmark.key_generator(config)
-local next_operation = benchmark.operation_selector(config, {'read', 'update'})
-
--------------------------------------------------------------------------------
--- Random value generator
--------------------------------------------------------------------------------
-
-local random_value = benchmark.value_generator(config.value_size)
-
--------------------------------------------------------------------------------
 -- Initial load (if needed)
 -------------------------------------------------------------------------------
 
@@ -79,6 +65,8 @@ local function load_data()
         return
     end
     log.info('bench_a: loading data from key %d to %d ...', count + 1, NUM_KEYS)
+    local random_value = benchmark.value_generator(config.value_size,
+        benchmark.random(config.seed, 'setup', 0))
     local batch = 0
     local t0 = clock.monotonic()
     box.begin()
@@ -115,7 +103,7 @@ benchmark.event('setup', 'end')
 -- Workload fibers
 -------------------------------------------------------------------------------
 
-local function worker(stats)
+local function worker(stats, random_key, random_value, next_operation)
     benchmark.transaction(stats, 'tx_mixed', function()
         local completed = {reads = 0, writes = 0, read_miss = 0, logical_write_bytes = 0}
         for _ = 1, BATCH_SIZE do
@@ -137,8 +125,12 @@ local function worker(stats)
     end)
 end
 
-math.randomseed(config.seed)
-local workers = {}
-for i = 1, NUM_FIBERS do workers[i] = worker end
-benchmark.run(space, workers, config)
+local function make_worker(random)
+    local random_key = benchmark.key_generator(config, random)
+    local random_value = benchmark.value_generator(config.value_size, random)
+    local next_operation = benchmark.operation_selector(config, {'read', 'update'}, random)
+    return function(stats) worker(stats, random_key, random_value, next_operation) end
+end
+
+benchmark.run(space, make_worker, config)
 os.exit(0)

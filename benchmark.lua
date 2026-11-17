@@ -4,6 +4,8 @@ local log = require('log')
 local fio = require('fio')
 local json = require('json')
 local msgpack = require('msgpack')
+local bit = require('bit')
+local digest = require('digest')
 
 local M = {}
 local REPORT_INTERVAL = 10
@@ -66,6 +68,8 @@ function M.config(workload, args)
         checkpoint_mode = os.getenv('CHECKPOINT_MODE') or 'auto',
         checkpoint_interval = option('CHECKPOINT_INTERVAL', 600, 0),
         seed = option('SEED', tonumber(clock.realtime64() % 2147483647), 0),
+        rng_algorithm = 'xoshiro128**-1.1',
+        rng_stream_scheme = 'sha256-seed-phase-worker-le32-v1',
         run_id = os.getenv('RUN_ID') or workload .. '-' .. string.format('%.0f', clock.realtime() * 1e6),
         output_dir = os.getenv('OUTPUT_DIR') or '.',
         tarantool_git_sha = os.getenv('TARANTOOL_GIT_SHA'),
@@ -116,31 +120,69 @@ function M.config(workload, args)
     config.native_checkpoint_interval = config.checkpoint_mode == 'auto' and config.checkpoint_interval or 0
 
     local defaults = {
-        a = {read = 0.5, update = 0.5},
-        b = {read = 0.5, insert = 0.5},
-        c = {delete = 0.3, insert = 0.2, scan = 0.3, read = 0.2},
+        a = {{'read', 0.5}, {'update', 0.5}},
+        b = {{'read', 0.5}, {'insert', 0.5}},
+        c = {{'delete', 0.3}, {'insert', 0.2}, {'scan', 0.3}, {'read', 0.2}},
     }
     config.mix_mode = 'ratio'
     if workload == 'b' and os.getenv('READ_RATIO') == nil and os.getenv('INSERT_RATIO') == nil then
         config.mix_mode = 'dedicated'
     else
         local total = 0
-        for operation, default in pairs(defaults[workload]) do
-            local name = operation .. '_ratio'
-            config[name] = option(name:upper(), default, 0)
+        -- A fixed summation order avoids rounding differences from hash iteration.
+        for _, item in ipairs(defaults[workload]) do
+            local name = item[1] .. '_ratio'
+            config[name] = option(name:upper(), item[2], 0)
             assert(config[name] <= 1, name .. ' must be in [0, 1]')
             total = total + config[name]
         end
         assert(math.abs(total - 1) <= 1e-9, 'operation ratios must sum to 1')
-        for operation in pairs(defaults[workload]) do
-            local name = operation .. '_ratio'
+        for _, item in ipairs(defaults[workload]) do
+            local name = item[1] .. '_ratio'
             config[name] = config[name] / total
         end
     end
     return config
 end
 
-function M.operation_selector(config, operations)
+function M.random(seed, phase, worker_id)
+    local hash = digest.sha256(string.format('%.0f:%s:%.0f', seed, phase, worker_id))
+    local function word(i)
+        local a, b, c, d = hash:byte(i, i + 3)
+        return bit.bor(a, bit.lshift(b, 8), bit.lshift(c, 16), bit.lshift(d, 24))
+    end
+    local s0, s1, s2, s3 = word(1), word(5), word(9), word(13)
+    if bit.bor(s0, s1, s2, s3) == 0 then s0 = 1 end
+    -- Public-domain reference: https://prng.di.unimi.it/xoshiro128starstar.c
+    local function next_u32()
+        local result = bit.tobit(bit.rol(s1 * 5, 7) * 9)
+        local t = bit.lshift(s1, 9)
+        s2 = bit.bxor(s2, s0)
+        s3 = bit.bxor(s3, s1)
+        s1 = bit.bxor(s1, s2)
+        s0 = bit.bxor(s0, s3)
+        s2 = bit.bxor(s2, t)
+        s3 = bit.rol(s3, 11)
+        return result < 0 and result + 4294967296 or result
+    end
+    local function next_u53()
+        local high = bit.rshift(next_u32(), 5)
+        return high * 67108864 + bit.rshift(next_u32(), 6)
+    end
+    return function(lower, upper)
+        if lower == nil then return next_u53() / 9007199254740992 end
+        local range = upper - lower + 1
+        local total, draw = 4294967296, next_u32
+        if range > total then total, draw = 9007199254740992, next_u53 end
+        -- Rejection avoids modulo bias, including for key ranges above 2^32.
+        local limit = total - total % range
+        local value
+        repeat value = draw() until value < limit
+        return lower + value % range
+    end
+end
+
+function M.operation_selector(config, operations, random)
     local choices, total = {}, 0
     for _, operation in ipairs(operations) do
         local ratio = config[operation .. '_ratio']
@@ -150,7 +192,7 @@ function M.operation_selector(config, operations)
         end
     end
     return function()
-        local u = math.random() * total
+        local u = random() * total
         for _, choice in ipairs(choices) do
             if u < choice.limit then return choice.operation end
         end
@@ -169,7 +211,7 @@ local function log1p(x)
     return math.log(1 + x)
 end
 
-function M.key_generator(config)
+function M.key_generator(config, random)
     local theta, distribution = config.zipf_theta, config.key_distribution
     local alpha = 1 / (1 - theta)
     local zeta_2 = 1 + 0.5 ^ theta
@@ -178,14 +220,14 @@ function M.key_generator(config)
         local n = math.max(1, math.floor(max_key * config.hotset_size))
         local offset = config.workload == 'b' and max_key - n or 0
         if distribution == 'latest' then
-            if math.random() < 0.8 then
-                return offset + math.random(math.max(1, math.floor(n * 0.99)), n)
+            if random() < 0.8 then
+                return offset + random(math.max(1, math.floor(n * 0.99)), n)
             end
-            return offset + math.random(1, n)
+            return offset + random(1, n)
         end
-        if distribution == 'uniform' or theta == 0 then return offset + math.random(1, n) end
+        if distribution == 'uniform' or theta == 0 then return offset + random(1, n) end
         if n == 1 then return offset + 1 end
-        local u = math.random()
+        local u = random()
         if n == 2 then return offset + (u * zeta_2 < 1 and 1 or 2) end
         if n ~= previous_n then
             -- Euler-Maclaurin approximation, as in the original workload A.
@@ -202,14 +244,14 @@ function M.key_generator(config)
     end
 end
 
-function M.value_generator(size)
+function M.value_generator(size, random)
     local bytes, chunks = {}, {}
     return function()
         local count = 0
         -- Bound the argument list to string.char/unpack for large values.
         for offset = 1, size, 256 do
             local length = math.min(256, size - offset + 1)
-            for i = 1, length do bytes[i] = math.random(97, 122) end
+            for i = 1, length do bytes[i] = random(97, 122) end
             count = count + 1
             chunks[count] = string.char(unpack(bytes, 1, length))
         end
@@ -505,7 +547,6 @@ function M.prepare(config)
     local written, err = csv:write(table.concat(columns, ',') .. '\n')
     if not written then csv:close(); error(err) end
     output = {csv = csv, summary_path = summary_path, config = config, events = {}}
-    math.randomseed(config.seed)
 end
 
 local function phase_result(phase, before, after, rss, requested)
@@ -622,8 +663,13 @@ local function stop_checkpoints()
     return checkpoint
 end
 
-function M.run_phase(space, stats, workers, phase, seconds)
+function M.run_phase(space, stats, make_worker, phase, seconds)
     M.number(seconds, phase .. ' seconds', 0)
+    local config = output.config
+    local workers = {}
+    for i = 1, config.workers do
+        workers[i] = make_worker(M.random(config.seed, phase, i), i)
+    end
     assert(#workers > 0, 'at least one worker is required')
     local deadline
     local stop, failure = false, nil
@@ -805,22 +851,22 @@ function M.summary(result, postrun)
     log.info('=== END REPORT ===')
 end
 
-function M.run(space, workers, config)
+function M.run(space, make_worker, config)
     local seconds, warmup = config.duration_seconds, config.warmup_seconds
     log.info('workload=%s workers=%d warmup_seconds=%.6f measurement_seconds=%.6f',
-             space.name, #workers, warmup, seconds)
+             space.name, config.workers, warmup, seconds)
     local stats = M.new_stats()
     stats.latency = {}
     for _, kind in ipairs(LATENCY_KINDS) do stats.latency[kind] = {} end
     local warmup_result, result, postrun
     local ok, err = pcall(function()
         if warmup > 0 then
-            warmup_result = M.run_phase(space, stats, workers, 'warmup', warmup)
+            warmup_result = M.run_phase(space, stats, make_worker, 'warmup', warmup)
         else
             M.event('warmup', 'skipped')
         end
         local after
-        result, after = M.run_phase(space, stats, workers, 'measurement', seconds)
+        result, after = M.run_phase(space, stats, make_worker, 'measurement', seconds)
         postrun = M.postrun(space, stats, after)
         assert(not output.checkpoint or not output.checkpoint.error,
                output.checkpoint and output.checkpoint.error)

@@ -32,7 +32,6 @@ local NUM_KEYS = config.num_keys
 local BATCH_SIZE = config.batch_size
 local LOAD_BATCH = 5000
 local SCAN_LENGTH = 200
-local NUM_FIBERS = config.workers
 
 box.cfg{
     log       = 'picodata.log',
@@ -64,14 +63,6 @@ end
 local space = box.space.bench_c
 
 -------------------------------------------------------------------------------
--- Random value generator
--------------------------------------------------------------------------------
-
-local random_value = benchmark.value_generator(config.value_size)
-local random_key = benchmark.key_generator(config)
-local next_operation = benchmark.operation_selector(config, {'delete', 'insert', 'scan', 'read'})
-
--------------------------------------------------------------------------------
 -- Initial load (if needed)
 -------------------------------------------------------------------------------
 
@@ -82,6 +73,8 @@ local function load_data()
         return
     end
     log.info('bench_c: loading data from key %d to %d ...', count + 1, NUM_KEYS)
+    local random_value = benchmark.value_generator(config.value_size,
+        benchmark.random(config.seed, 'setup', 0))
     local batch = 0
     local t0 = clock.monotonic()
     box.begin()
@@ -120,7 +113,7 @@ benchmark.event('setup', 'end')
 
 local next_new_key = NUM_KEYS + 1
 
-local function worker(stats)
+local function worker(stats, random_key, random_value, next_operation)
     local op = next_operation()
     if op == 'delete' then
         benchmark.transaction(stats, 'tx_delete', function()
@@ -177,8 +170,12 @@ local function worker(stats)
     end
 end
 
-math.randomseed(config.seed)
-local workers = {}
-for i = 1, NUM_FIBERS do workers[i] = worker end
-benchmark.run(space, workers, config)
+local function make_worker(random)
+    local random_key = benchmark.key_generator(config, random)
+    local random_value = benchmark.value_generator(config.value_size, random)
+    local next_operation = benchmark.operation_selector(config, {'delete', 'insert', 'scan', 'read'}, random)
+    return function(stats) worker(stats, random_key, random_value, next_operation) end
+end
+
+benchmark.run(space, make_worker, config)
 os.exit(0)

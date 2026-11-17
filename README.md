@@ -119,9 +119,23 @@ switches to `WRITERS + READERS` mixed workers. Only the selected workload's
 ratio variables apply; set every ratio needed to make their sum 1.
 
 Launch scripts inherit these variables; use individual scripts for different
-A/B/C settings. Each launcher shares one seed across its runs. Setup and workload
-each start from that seed; scheduling and time limits can still change the sequence
-of operations completed by concurrent workers.
+A/B/C settings. Each launcher shares one seed across its runs.
+
+### Reproducibility
+
+Each worker has a private xoshiro128** stream, initialized before each phase from
+SHA-256 of `seed:phase:worker_id`. Setup uses ID `0`; warmup and measurement use
+IDs `1..WORKERS` (B: `1..WRITERS+READERS`, writers first in dedicated mode).
+Warmup never advances measurement's random stream. The first 16 hash bytes form
+four little-endian state words; an all-zero state becomes `(1, 0, 0, 0)`.
+`config.rng_algorithm` and `config.rng_stream_scheme` identify this scheme in JSON
+and logs. Floats use 53 random bits; integer ranges use rejection sampling.
+
+Compare fresh datasets with the same configuration, seed and RNG scheme. Matching
+inputs reproduce initial random streams, not identical execution: warmup changes
+data, transaction failures change random consumption, B/C key ranges grow, and
+scheduling/time limits affect completed operations. Streams differ from earlier
+versions that used shared `math.random()`.
 
 ## Research scenarios
 
@@ -202,7 +216,8 @@ termination may leave only the initial incomplete summary. No per-operation samp
 - Reused directories keep existing tuples. B appends after the maximum key and
   preserves gaps; C key allocation on restart still needs work. Use fresh data for comparisons.
 
-Remaining: runtime/reproducibility validation and agreement on the baseline procedure.
+All T1–T6 workloads are configurable. Remaining: runtime/reproducibility validation,
+generator overhead measurement and agreement on the baseline procedure.
 
 ## License
 

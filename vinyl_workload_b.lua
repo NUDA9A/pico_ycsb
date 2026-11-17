@@ -32,7 +32,6 @@ local INITIAL_KEYS = config.num_keys
 local BATCH_SIZE = config.batch_size
 local LOAD_BATCH = 5000
 local NUM_WRITERS = config.writers
-local NUM_READERS = config.readers
 local MAX_KEY = 9007199254740991
 
 box.cfg{
@@ -66,13 +65,6 @@ end
 local space = box.space.bench_b
 
 -------------------------------------------------------------------------------
--- Random value generator
--------------------------------------------------------------------------------
-
-local random_value = benchmark.value_generator(config.value_size)
-local random_key = benchmark.key_generator(config)
-
--------------------------------------------------------------------------------
 -- Initial load (if needed)
 -------------------------------------------------------------------------------
 
@@ -88,6 +80,8 @@ local function load_data()
         return max_key
     end
     log.info('bench_b: loading %d rows from key %d to %d ...', missing, max_key + 1, max_key + missing)
+    local random_value = benchmark.value_generator(config.value_size,
+        benchmark.random(config.seed, 'setup', 0))
     local batch = 0
     local t0 = clock.monotonic()
     box.begin()
@@ -128,7 +122,7 @@ benchmark.event('setup', 'end')
 local next_key = last_key + 1
 local append = config.write_mode == 'insert' and space.insert or space.replace
 
-local function writer(stats)
+local function writer(stats, random_value)
     local base = next_key
     assert(BATCH_SIZE <= MAX_KEY - base + 1, 'append would exhaust the exact integer key range')
     next_key = next_key + BATCH_SIZE
@@ -144,7 +138,7 @@ local function writer(stats)
     end)
 end
 
-local function reader(stats)
+local function reader(stats, random_key)
     benchmark.operations(stats, function()
         for _ = 1, BATCH_SIZE do
             local max_key = next_key - 1
@@ -160,17 +154,20 @@ local function reader(stats)
     end)
 end
 
-math.randomseed(config.seed)
-local workers = {}
-if config.mix_mode == 'dedicated' then
-    for _ = 1, NUM_WRITERS do workers[#workers + 1] = writer end
-    for _ = 1, NUM_READERS do workers[#workers + 1] = reader end
-else
-    local next_operation = benchmark.operation_selector(config, {'read', 'insert'})
-    local function mixed(stats)
-        if next_operation() == 'read' then reader(stats) else writer(stats) end
+local function make_worker(random, id)
+    local random_key = benchmark.key_generator(config, random)
+    local random_value = benchmark.value_generator(config.value_size, random)
+    if config.mix_mode == 'dedicated' then
+        if id <= NUM_WRITERS then
+            return function(stats) writer(stats, random_value) end
+        end
+        return function(stats) reader(stats, random_key) end
     end
-    for i = 1, config.workers do workers[i] = mixed end
+    local next_operation = benchmark.operation_selector(config, {'read', 'insert'}, random)
+    return function(stats)
+        if next_operation() == 'read' then reader(stats, random_key) else writer(stats, random_value) end
+    end
 end
-benchmark.run(space, workers, config)
+
+benchmark.run(space, make_worker, config)
 os.exit(0)
