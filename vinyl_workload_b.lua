@@ -77,7 +77,7 @@ local function load_data()
     assert(missing <= MAX_KEY - max_key, 'initial load would exhaust the exact integer key range')
     if missing == 0 then
         log.info('bench_b: data already loaded (%d rows)', count)
-        return max_key
+        return max_key, false
     end
     log.info('bench_b: loading %d rows from key %d to %d ...', missing, max_key + 1, max_key + missing)
     local random_value = benchmark.value_generator(config.value_size,
@@ -108,12 +108,11 @@ local function load_data()
     end
     local elapsed = clock.monotonic() - t0
     log.info('bench_b: load complete, %d rows in %.1fs', space:count(), elapsed)
-    benchmark.snapshot()
-    return max_key + missing
+    return max_key + missing, true
 end
 
-local last_key = load_data()
-benchmark.event('setup', 'end')
+local last_key, did_load = load_data()
+benchmark.finish_setup(did_load)
 
 -------------------------------------------------------------------------------
 -- Shared state

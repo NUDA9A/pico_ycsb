@@ -40,7 +40,7 @@ for parameter in NUM_KEYS VALUE_SIZE VINYL_MEMORY VINYL_CACHE BATCH_SIZE \
                  DURATION_SECONDS WARMUP_SECONDS WORKERS WRITERS READERS \
                  READ_RATIO UPDATE_RATIO INSERT_RATIO DELETE_RATIO SCAN_RATIO \
                  KEY_DISTRIBUTION ZIPF_THETA HOTSET_SIZE CHECKPOINT_MODE CHECKPOINT_INTERVAL \
-                 WRITE_MODE SEED TARANTOOL_GIT_SHA; do
+                 SETUP_SNAPSHOT WRITE_MODE SEED TARANTOOL_GIT_SHA; do
     echo "${parameter}: ${!parameter-<default>}"
 done
 echo "Resolved parameters are recorded as Configuration in picodata.log."
@@ -84,16 +84,16 @@ for window in auto zero; do
         cp "$SCRIPT" "$PATCHED"
         cp "${SCRIPT_DIR}/benchmark.lua" "${DIR}/benchmark.lua"
 
-        # All workloads have the same setup-end marker, including B.
+        # Apply SI settings after setup and its Vinyl statistics sample.
         if [ "$window" = "zero" ]; then
-            sed -i '/^benchmark[.]event.*setup.*end/a \
+            sed -i '/^benchmark[.]finish_setup(/a \
 local _ffi = require("ffi")\
 _ffi.cdef("void vinyl_set_conflict_window(int64_t w)")\
 _ffi.C.vinyl_set_conflict_window(0)\
 require("log").info("bench: conflict_window forced to 0")\
 dofile("../si_metrics_patch.lua")' "$PATCHED"
         else
-            sed -i '/^benchmark[.]event.*setup.*end/a \
+            sed -i '/^benchmark[.]finish_setup(/a \
 require("log").info("bench: conflict_window = auto")\
 dofile("../si_metrics_patch.lua")' "$PATCHED"
         fi

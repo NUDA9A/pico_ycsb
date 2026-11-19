@@ -65,6 +65,7 @@ function M.config(workload, args)
                            (workload == 'a' and 'zipfian' or workload == 'b' and 'latest' or 'uniform'),
         zipf_theta = option('ZIPF_THETA', 0.99, 0),
         hotset_size = option('HOTSET_SIZE', 1, 0),
+        setup_snapshot = os.getenv('SETUP_SNAPSHOT') or 'on',
         checkpoint_mode = os.getenv('CHECKPOINT_MODE') or 'auto',
         checkpoint_interval = option('CHECKPOINT_INTERVAL', 600, 0),
         seed = option('SEED', tonumber(clock.realtime64() % 2147483647), 0),
@@ -91,6 +92,8 @@ function M.config(workload, args)
            'KEY_DISTRIBUTION must be uniform or zipfian (also latest for B)')
     assert(config.zipf_theta < 1, 'ZIPF_THETA must be in [0, 1)')
     assert(config.hotset_size > 0 and config.hotset_size <= 1, 'HOTSET_SIZE must be in (0, 1]')
+    assert(config.setup_snapshot == 'on' or config.setup_snapshot == 'off',
+           'SETUP_SNAPSHOT must be on or off')
     assert(config.checkpoint_mode == 'auto' or config.checkpoint_mode == 'off' or
            config.checkpoint_mode == 'forced', 'CHECKPOINT_MODE must be auto, off or forced')
     if config.checkpoint_mode == 'forced' then
@@ -270,13 +273,6 @@ function M.event(phase, event, details)
              phase, event, monotonic, realtime, details and ' details=' .. json.encode(details) or '')
 end
 
-function M.snapshot()
-    M.event('setup', 'checkpoint_start')
-    local ok, err = pcall(box.snapshot)
-    M.event('setup', ok and 'checkpoint_end' or 'checkpoint_failed')
-    if not ok then error(err) end
-end
-
 function M.new_stats()
     return {
         reads = 0, writes = 0, inserts = 0, deletes = 0, scans = 0,
@@ -418,6 +414,7 @@ local index_gauges = {
 }
 local vinyl_gauges = {
     tasks_inprogress = 'scheduler.tasks_inprogress', memory_level0 = 'memory.level0',
+    dump_watermark = 'regulator.dump_watermark', memory_tuple = 'memory.tuple',
     memory_tx = 'memory.tx', cache_memory = 'index_cache.mem_used',
     dict_active = 'dict.dicts_active', dict_bytes = 'dict.dicts_bytes',
 }
@@ -507,6 +504,28 @@ local function nullable_fields(values, fields)
     local result = {}
     for name in pairs(fields) do result[name] = values[name] or json.NULL end
     return result
+end
+
+function M.finish_setup(did_load)
+    if did_load and output.config.setup_snapshot == 'on' then
+        M.event('setup', 'checkpoint_start')
+        local ok, err = pcall(box.snapshot)
+        M.event('setup', ok and 'checkpoint_end' or 'checkpoint_failed')
+        if not ok then error(err) end
+    else
+        local reason = did_load and 'disabled' or 'already_loaded'
+        M.event('setup', 'checkpoint_skipped', {reason = reason})
+    end
+    M.event('setup', 'end')
+    local fields = {
+        memory_level0 = vinyl_gauges.memory_level0,
+        dump_watermark = vinyl_gauges.dump_watermark,
+        memory_tuple = vinyl_gauges.memory_tuple,
+        scheduler_dumps = vinyl_counters.scheduler_dumps,
+    }
+    local state = {}
+    collect(state, box.stat.vinyl(), fields)
+    M.event('setup', 'setup_vinyl_state', nullable_fields(state, fields))
 end
 
 local columns = {'run_id', 'phase', 'start_monotonic', 'end_monotonic', 'seconds',

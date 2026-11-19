@@ -82,6 +82,7 @@ validated before `box.cfg()`. Resolved values are logged as `Configuration:`.
 | `KEY_DISTRIBUTION` | `uniform` / `zipfian` / `latest` (B-only); defaults: A `zipfian`, B `latest`, C `uniform` |
 | `ZIPF_THETA` | `0.99`, in `[0, 1)` |
 | `HOTSET_SIZE` | Eligible fraction of the key range, in `(0, 1]`: `1` |
+| `SETUP_SNAPSHOT` | `on` (default) calls `box.snapshot()` after loading new rows. `off` skips this call. |
 | `CHECKPOINT_MODE` | `auto` (default), `off` or `forced` |
 | `CHECKPOINT_INTERVAL` | Seconds: `600`; `off` forces `0`; `forced` requires `0 < interval < duration` |
 | `SEED` | Integer in `[0, 2147483647]`; generated when omitted and saved in the results |
@@ -100,7 +101,9 @@ the daemon and calls `box.snapshot()` at interval multiples from measurement
 start, strictly before its deadline. Workers and Vinyl background work continue
 normally; elapsed slots are skipped when a snapshot or scheduling takes too long.
 The effective daemon interval is logged as `native_checkpoint_interval`.
-All modes retain the snapshot after initial loading; forced calls do not run in warmup.
+`SETUP_SNAPSHOT` applies independently in all three modes. Setup records
+`checkpoint_skipped` with reason `already_loaded` when setup loads no rows,
+or `disabled` when it loads rows with the snapshot off.
 
 ### Operation ratios
 
@@ -144,7 +147,7 @@ Examples use separate result directories; sizes and durations require calibratio
 ```bash
 # T1: repeated overwrites of a small working set.
 NUM_KEYS=100000 VALUE_SIZE=90 VINYL_MEMORY=67108864 READ_RATIO=0 UPDATE_RATIO=1 \
-    KEY_DISTRIBUTION=uniform CHECKPOINT_MODE=off SEED=1 \
+    KEY_DISTRIBUTION=uniform SETUP_SNAPSHOT=off CHECKPOINT_MODE=off SEED=1 \
     ./run_all.sh /path/to/tarantool t1 10 a
 
 # T3: sequential INSERT-only, using explicit ratios to exclude reads.
@@ -153,12 +156,13 @@ WRITE_MODE=insert READ_RATIO=0 INSERT_RATIO=1 WRITERS=4 READERS=0 SEED=1 \
 
 # T6: T1 with checkpoints under load, every 30 seconds.
 NUM_KEYS=100000 VALUE_SIZE=90 VINYL_MEMORY=67108864 READ_RATIO=0 UPDATE_RATIO=1 \
-    KEY_DISTRIBUTION=uniform CHECKPOINT_MODE=forced CHECKPOINT_INTERVAL=30 SEED=1 \
+    KEY_DISTRIBUTION=uniform SETUP_SNAPSHOT=off CHECKPOINT_MODE=forced CHECKPOINT_INTERVAL=30 SEED=1 \
     ./run_all.sh /path/to/tarantool t6 10 a
 ```
 
-T1's RAM residency must be checked using actual memory metrics, including retained
-versions and engine overhead. For T2, increase the dataset and reduce `HOTSET_SIZE`.
+Vinyl can dump during loading under memory pressure. For T1/T6, check the initial
+L0 size and dump count in the `setup_vinyl_state` event. For T2, increase the
+dataset and reduce `HOTSET_SIZE`.
 
 ## Metrics
 
@@ -172,6 +176,12 @@ Every 10 seconds and for the final partial interval, the log reports:
 - **RSS:** time-weighted mean and maximum observed process memory on Linux.
 - Forced checkpoint starts, completions, failures and skipped slots.
 - Vinyl dump/compaction I/O, bloom/cache statistics and memory gauges.
+
+At the end of setup, `summary.json` records a `setup_vinyl_state` event.
+Its `details` contain `memory_level0` (bytes in L0), `dump_watermark` (current
+dump threshold in bytes), `memory_tuple` (bytes used by the Vinyl tuple allocator)
+and `scheduler_dumps` (cumulative Vinyl dump count). The same three memory gauges
+appear in CSV intervals, JSON phase boundaries and logs.
 
 Phases: **setup → warmup → measurement → postrun**. Final counters exclude
 setup/warmup; rates use actual elapsed time, including batch completion.

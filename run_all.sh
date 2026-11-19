@@ -58,7 +58,7 @@ for parameter in NUM_KEYS VALUE_SIZE VINYL_MEMORY VINYL_CACHE BATCH_SIZE \
                  DURATION_SECONDS WARMUP_SECONDS WORKERS WRITERS READERS \
                  READ_RATIO UPDATE_RATIO INSERT_RATIO DELETE_RATIO SCAN_RATIO \
                  KEY_DISTRIBUTION ZIPF_THETA HOTSET_SIZE CHECKPOINT_MODE CHECKPOINT_INTERVAL \
-                 WRITE_MODE SEED TARANTOOL_GIT_SHA; do
+                 SETUP_SNAPSHOT WRITE_MODE SEED TARANTOOL_GIT_SHA; do
     echo "${parameter}: ${!parameter-<default>}"
 done
 echo "Resolved parameters are recorded as Configuration in picodata.log."

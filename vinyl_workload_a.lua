@@ -62,7 +62,7 @@ local function load_data()
     local count = space:count()
     if count >= NUM_KEYS then
         log.info('bench_a: data already loaded (%d rows)', count)
-        return
+        return false
     end
     log.info('bench_a: loading data from key %d to %d ...', count + 1, NUM_KEYS)
     local random_value = benchmark.value_generator(config.value_size,
@@ -93,11 +93,11 @@ local function load_data()
     end
     local elapsed = clock.monotonic() - t0
     log.info('bench_a: load complete, %d rows in %.1fs', space:count(), elapsed)
-    benchmark.snapshot()
+    return true
 end
 
-load_data()
-benchmark.event('setup', 'end')
+local did_load = load_data()
+benchmark.finish_setup(did_load)
 
 -------------------------------------------------------------------------------
 -- Workload fibers
